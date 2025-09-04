@@ -642,10 +642,19 @@ async def send_gmail_message(
     if thread_id_final:
         send_body["threadId"] = thread_id_final
 
-    # Send the message
-    sent_message = await asyncio.to_thread(
-        service.users().messages().send(userId="me", body=send_body).execute
-    )
+    # Send the message with a timeout to avoid indefinite hangs
+    try:
+        sent_message = await asyncio.wait_for(
+            asyncio.to_thread(
+                service.users().messages().send(userId="me", body=send_body).execute
+            ),
+            timeout=30,
+        )
+    except asyncio.TimeoutError:
+        raise Exception(
+            "Gmail send request timed out after 30 seconds. This may be a network/proxy issue blocking POST requests. Try again later or use draft_gmail_message."
+        )
+
     message_id = sent_message.get("id")
     return f"Email sent! Message ID: {message_id}"
 
