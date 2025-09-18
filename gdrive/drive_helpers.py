@@ -96,6 +96,7 @@ def build_drive_list_params(
         "fields": "nextPageToken, files(id, name, mimeType, webViewLink, iconLink, modifiedTime, size)",
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": include_items_from_all_drives,
+        "orderBy": "modifiedTime desc",
     }
 
     if drive_id:

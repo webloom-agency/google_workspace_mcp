@@ -5,6 +5,7 @@ This module provides MCP tools for interacting with Google Drive API.
 """
 import logging
 import asyncio
+import re
 from typing import Optional
 
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -60,6 +61,10 @@ async def search_drive_files(
         escaped_query = query.replace("'", "\\'")
         final_query = f"fullText contains '{escaped_query}'"
         logger.info(f"[search_drive_files] Reformatting free text query '{query}' to '{final_query}'")
+
+    # Ensure we exclude trashed items unless explicitly requested
+    if not re.search(r"\btrashed\s*=\s*(true|false)\b", final_query, re.IGNORECASE):
+        final_query = f"{final_query} and trashed=false"
 
     list_params = build_drive_list_params(
         query=final_query,
