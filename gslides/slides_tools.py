@@ -64,46 +64,150 @@ async def create_presentation(
 async def get_presentation(
     service,
     user_google_email: str,
-    presentation_id: str
+    presentation_id: str,
+    include_text: bool = True,
+    include_notes: bool = True,
+    max_chars_per_slide: int = 4000,
+    max_slides: int | None = None
 ) -> str:
     """
-    Get details about a Google Slides presentation.
+    Get details and content of a Google Slides presentation.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         presentation_id (str): The ID of the presentation to retrieve.
+        include_text (bool): Whether to extract visible text from shapes/tables. Default True.
+        include_notes (bool): Whether to extract speaker notes text. Default True.
+        max_chars_per_slide (int): Safety cap to avoid overly long outputs per slide. Default 4000.
+        max_slides (Optional[int]): If set, limit processing to the first N slides.
 
     Returns:
-        str: Details about the presentation including title, slides count, and metadata.
+        str: Details plus per-slide extracted content.
     """
     logger.info(f"[get_presentation] Invoked. Email: '{user_google_email}', ID: '{presentation_id}'")
 
-    result = await asyncio.to_thread(
+    presentation = await asyncio.to_thread(
         service.presentations().get(presentationId=presentation_id).execute
     )
 
-    title = result.get('title', 'Untitled')
-    slides = result.get('slides', [])
-    page_size = result.get('pageSize', {})
+    title = presentation.get('title', 'Untitled')
+    slides = presentation.get('slides', [])
+    page_size = presentation.get('pageSize', {})
 
-    slides_info = []
-    for i, slide in enumerate(slides, 1):
+    def extract_text_from_text_elements(text_elements: list[dict]) -> str:
+        lines = []
+        for te in text_elements or []:
+            text_run = te.get('textRun')
+            if text_run:
+                content = text_run.get('content', '')
+                if content:
+                    lines.append(content)
+        return ''.join(lines)
+
+    def extract_shape_text(shape: dict) -> str:
+        text_content = []
+        text = (shape or {}).get('text', {})
+        for pe in text.get('textElements', []) or []:
+            tr = pe.get('textRun')
+            if tr and 'content' in tr:
+                text_content.append(tr['content'])
+        return ''.join(text_content).strip()
+
+    def extract_table_text(table: dict) -> str:
+        cell_text_parts = []
+        rows = table.get('rows', 0)
+        cols = table.get('columns', 0)
+        table_cells = table.get('tableRows', []) or []
+        # Some APIs expose rows via tableRows, others via a grid-like structure
+        for row in table_cells:
+            cells = row.get('tableCells', []) or []
+            row_parts = []
+            for cell in cells:
+                cell_text = []
+                for ce in cell.get('text', {}).get('textElements', []) or []:
+                    tr = ce.get('textRun')
+                    if tr and 'content' in tr:
+                        cell_text.append(tr['content'])
+                row_parts.append(''.join(cell_text).strip())
+            if row_parts:
+                cell_text_parts.append(' | '.join(row_parts))
+        # Fallback if above structure not present
+        if not cell_text_parts and rows and cols:
+            cell_text_parts.append(f"[{rows}x{cols} table content not parsed]")
+        return '\n'.join(cell_text_parts).strip()
+
+    def truncate(text: str, limit: int) -> str:
+        if limit and len(text) > limit:
+            return text[:limit] + "\n[...truncated...]"
+        return text
+
+    slide_outputs = []
+    total_slides = len(slides)
+    process_count = min(total_slides, max_slides) if max_slides else total_slides
+
+    for index, slide in enumerate(slides[:process_count], start=1):
         slide_id = slide.get('objectId', 'Unknown')
-        page_elements = slide.get('pageElements', [])
-        slides_info.append(f"  Slide {i}: ID {slide_id}, {len(page_elements)} element(s)")
+        elements = slide.get('pageElements', []) or []
 
-    confirmation_message = f"""Presentation Details for {user_google_email}:
-- Title: {title}
-- Presentation ID: {presentation_id}
-- URL: https://docs.google.com/presentation/d/{presentation_id}/edit
-- Total Slides: {len(slides)}
-- Page Size: {page_size.get('width', {}).get('magnitude', 'Unknown')} x {page_size.get('height', {}).get('magnitude', 'Unknown')} {page_size.get('width', {}).get('unit', '')}
+        visible_text_parts = []
+        if include_text:
+            for el in elements:
+                if 'shape' in el:
+                    text_value = extract_shape_text(el.get('shape', {}))
+                    if text_value:
+                        visible_text_parts.append(text_value)
+                elif 'table' in el:
+                    table_text = extract_table_text(el.get('table', {}))
+                    if table_text:
+                        visible_text_parts.append(table_text)
 
-Slides Breakdown:
-{chr(10).join(slides_info) if slides_info else '  No slides found'}"""
+        notes_text = ''
+        if include_notes:
+            notes_page = slide.get('slideProperties', {}).get('notesPage') or slide.get('notesPage')
+            if not notes_page:
+                # Some API responses nest notes at top-level of slide
+                notes_page = slide.get('notesPage')
+            if notes_page:
+                # The notes page contains a shape with the notes content
+                notes_elements = (notes_page.get('notesProperties', {}) or {}).get('speakerNotesObjectId')
+                # More robustly iterate all page elements of notesPage
+                for npe in (notes_page.get('pageElements') or []):
+                    shape = npe.get('shape')
+                    if shape:
+                        candidate = extract_shape_text(shape)
+                        if candidate:
+                            notes_text += candidate
+                notes_text = notes_text.strip()
 
-    logger.info(f"Presentation retrieved successfully for {user_google_email}")
-    return confirmation_message
+        slide_text = ''
+        if visible_text_parts:
+            slide_text += ("\n".join(visible_text_parts)).strip()
+        if notes_text:
+            slide_text += ("\n\n--- SPEAKER NOTES ---\n" + notes_text)
+
+        slide_text = truncate(slide_text, max_chars_per_slide) if slide_text else ''
+
+        # Build section output for this slide
+        header = f"Slide {index}/{total_slides} (ID: {slide_id})"
+        if slide_text:
+            slide_outputs.append(f"{header}\n{slide_text}")
+        else:
+            slide_outputs.append(f"{header}\n[No extractable text]")
+
+    summary_header = (
+        f"Presentation Details for {user_google_email}:\n"
+        f"- Title: {title}\n"
+        f"- Presentation ID: {presentation_id}\n"
+        f"- URL: https://docs.google.com/presentation/d/{presentation_id}/edit\n"
+        f"- Total Slides: {len(slides)}\n"
+        f"- Page Size: {page_size.get('width', {}).get('magnitude', 'Unknown')} x {page_size.get('height', {}).get('magnitude', 'Unknown')} {page_size.get('width', {}).get('unit', '')}\n"
+    )
+
+    content_intro = "\n--- CONTENT (first {n} slides) ---\n".format(n=process_count)
+    full_output = summary_header + content_intro + ("\n\n".join(slide_outputs) if slide_outputs else "No slides found")
+
+    logger.info(f"Presentation retrieved successfully with content for {user_google_email}")
+    return full_output
 
 
 @server.tool()
