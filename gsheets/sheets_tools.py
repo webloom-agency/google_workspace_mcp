@@ -578,16 +578,23 @@ async def deduplicate_rows_by_headers(
     service,
     user_google_email: str,
     spreadsheet_id: str,
-    sheet_name: str,
-    key_headers: Union[str, List[str]],
-    sort_header: str,
+    sheet_name: Optional[str] = None,
+    key_headers: Union[str, List[str]] = None,
+    sort_header: str = None,
     keep: str = "max",
     work_on_copy: bool = False,
     destination_sheet_name: Optional[str] = None,
+    sheet_id: Optional[int] = None,
 ) -> str:
     """
     Deduplicates rows in a sheet by one or more key headers, keeping the row with
     the max (or min) value in the specified sort column.
+
+    Sheet selection precedence:
+      1) sheet_id if provided
+      2) sheet_name (exact, then case/space-normalized)
+      3) if exactly one sheet exists, use it
+      4) otherwise error listing available sheets
 
     Fast path based on Sheets server-side operations:
       1) Sort rows (excluding header) by the sort column (DESC for max, ASC for min)
@@ -596,19 +603,23 @@ async def deduplicate_rows_by_headers(
     Args:
         user_google_email: The user's Google email address. Required.
         spreadsheet_id: Spreadsheet ID. Required.
-        sheet_name: Target sheet title. Required.
-        key_headers: Header name or list of header names used as the dedupe key.
-        sort_header: Header name of the column used to choose which row to keep.
+        sheet_name: Target sheet title. Optional if sheet_id provided or only one sheet.
+        key_headers: Header name or list of header names used as the dedupe key. Required.
+        sort_header: Header name used to choose which row to keep. Required.
         keep: "max" or "min". Defaults to "max".
         work_on_copy: If True, duplicates the sheet first and operates on the copy.
         destination_sheet_name: Optional name for the copied sheet when work_on_copy=True.
+        sheet_id: Optional numeric sheetId (preferred for robustness).
 
     Returns:
         Summary string indicating the target sheet, operation mode, and columns used.
     """
     logger.info(
-        f"[deduplicate_rows_by_headers] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Sheet: {sheet_name}, keep: {keep}, work_on_copy: {work_on_copy}"
+        f"[deduplicate_rows_by_headers] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, SheetName: {sheet_name}, SheetId: {sheet_id}, keep: {keep}, work_on_copy: {work_on_copy}"
     )
+
+    if key_headers is None or sort_header is None:
+        raise Exception("'key_headers' and 'sort_header' are required.")
 
     # Normalize key headers
     key_headers_list: List[str] = [key_headers] if isinstance(key_headers, str) else list(key_headers)
@@ -619,20 +630,52 @@ async def deduplicate_rows_by_headers(
     if keep_normalized not in ("max", "min"):
         raise Exception("'keep' must be either 'max' or 'min'.")
 
-    # 1) Resolve sheetId and grid size
+    # 1) Resolve sheetId and title
     spreadsheet = await asyncio.to_thread(
         service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute
     )
 
     sheets = spreadsheet.get("sheets", [])
-    target_sheet = None
-    for s in sheets:
-        if s.get("properties", {}).get("title") == sheet_name:
-            target_sheet = s
-            break
-    if not target_sheet:
-        raise Exception(f"Sheet '{sheet_name}' not found in spreadsheet {spreadsheet_id}.")
+    if not sheets:
+        raise Exception(f"Spreadsheet {spreadsheet_id} has no sheets.")
 
+    def _norm(t: str) -> str:
+        return " ".join(t.split()).lower()
+
+    target_sheet = None
+
+    # Prefer sheet_id if provided
+    if sheet_id is not None:
+        for s in sheets:
+            if s.get("properties", {}).get("sheetId") == sheet_id:
+                target_sheet = s
+                break
+        if target_sheet is None:
+            available = [(s.get("properties", {}).get("title", ""), s.get("properties", {}).get("sheetId")) for s in sheets]
+            raise Exception(f"sheet_id {sheet_id} not found. Available: {available}")
+    else:
+        # Try by sheet_name if provided
+        if sheet_name:
+            for s in sheets:
+                if s.get("properties", {}).get("title") == sheet_name:
+                    target_sheet = s
+                    break
+            if target_sheet is None:
+                normalized_input = _norm(sheet_name)
+                candidates = [s for s in sheets if _norm(s.get("properties", {}).get("title", "")) == normalized_input]
+                if len(candidates) == 1:
+                    target_sheet = candidates[0]
+        # If still none, use only sheet if there is exactly one
+        if target_sheet is None:
+            if len(sheets) == 1:
+                target_sheet = sheets[0]
+            else:
+                available = [(s.get("properties", {}).get("title", ""), s.get("properties", {}).get("sheetId")) for s in sheets]
+                raise Exception(
+                    f"No sheet selector resolved. Provide 'sheet_id' or 'sheet_name'. Available: {available}"
+                )
+
+    effective_sheet_title = target_sheet.get("properties", {}).get("title")
     source_sheet_id = target_sheet.get("properties", {}).get("sheetId")
     grid_props = target_sheet.get("properties", {}).get("gridProperties", {})
     total_rows = grid_props.get("rowCount", 1000000)
@@ -642,7 +685,7 @@ async def deduplicate_rows_by_headers(
     header_result = await asyncio.to_thread(
         service.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!1:1")
+        .get(spreadsheetId=spreadsheet_id, range=f"{effective_sheet_title}!1:1")
         .execute
     )
     header_values = header_result.get("values", [])
@@ -654,7 +697,7 @@ async def deduplicate_rows_by_headers(
         try:
             return headers.index(header_name)
         except ValueError:
-            raise Exception(f"Header '{header_name}' not found in sheet '{sheet_name}'.")
+            raise Exception(f"Header '{header_name}' not found in sheet '{effective_sheet_title}'.")
 
     sort_col_index = header_to_col_index_or_raise(sort_header)
     key_col_indices = [header_to_col_index_or_raise(h) for h in key_headers_list]
@@ -669,7 +712,7 @@ async def deduplicate_rows_by_headers(
                 "duplicateSheet": {
                     "sourceSheetId": source_sheet_id,
                     "insertSheetIndex": 0,
-                    "newSheetName": destination_sheet_name or f"{sheet_name} (dedup)"
+                    "newSheetName": destination_sheet_name or f"{effective_sheet_title} (dedup)"
                 }
             }
         )
@@ -731,13 +774,13 @@ async def deduplicate_rows_by_headers(
         }
     )
 
-    response = await asyncio.to_thread(
+    _ = await asyncio.to_thread(
         service.spreadsheets()
         .batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests})
         .execute
     )
 
-    target_title = sheet_name if not work_on_copy else (destination_sheet_name or f"{sheet_name} (dedup)")
+    target_title = effective_sheet_title if not work_on_copy else (destination_sheet_name or f"{effective_sheet_title} (dedup)")
     return (
         f"Deduplicated sheet '{target_title}' by keys {key_headers_list}, keeping {keep_normalized} of '{sort_header}'."
     )
