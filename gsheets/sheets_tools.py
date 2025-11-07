@@ -257,6 +257,88 @@ async def modify_sheet_values(
 
 
 @server.tool()
+@handle_http_errors("append_sheet_values", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def append_sheet_values(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    range_name: str,
+    values: Optional[Union[str, List[List[str]]]] = None,
+    value_input_option: str = "USER_ENTERED",
+    insert_data_option: str = "INSERT_ROWS",
+) -> str:
+    """
+    Appends rows to a Google Sheet without overwriting existing data.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        range_name (str): The target range or sheet (e.g., "Sheet1", "Sheet1!A1"). Required.
+        values (Optional[Union[str, List[List[str]]]]): 2D array of values to append. Can be a JSON string or Python list.
+        value_input_option (str): How to interpret input values ("RAW" or "USER_ENTERED"). Defaults to "USER_ENTERED".
+        insert_data_option (str): How to insert the data ("OVERWRITE" or "INSERT_ROWS"). Defaults to "INSERT_ROWS".
+
+    Returns:
+        str: Confirmation message including how many rows/cells were appended.
+    """
+    logger.info(
+        f"[append_sheet_values] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Range: {range_name}"
+    )
+
+    # Parse values if it's a JSON string (MCP passes parameters as JSON strings)
+    if values is not None and isinstance(values, str):
+        try:
+            parsed_values = json.loads(values)
+            if not isinstance(parsed_values, list):
+                raise ValueError(f"Values must be a list, got {type(parsed_values).__name__}")
+            for i, row in enumerate(parsed_values):
+                if not isinstance(row, list):
+                    raise ValueError(f"Row {i} must be a list, got {type(row).__name__}")
+            values = parsed_values
+            logger.info(
+                f"[append_sheet_values] Parsed JSON string to Python list with {len(values)} rows"
+            )
+        except json.JSONDecodeError as e:
+            raise Exception(f"Invalid JSON format for values: {e}")
+        except ValueError as e:
+            raise Exception(f"Invalid values structure: {e}")
+
+    if not values:
+        raise Exception("'values' must be provided and be a non-empty 2D array.")
+
+    body = {"values": values}
+
+    result = await asyncio.to_thread(
+        service.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption=value_input_option,
+            insertDataOption=insert_data_option,
+            body=body,
+        )
+        .execute
+    )
+
+    updates = result.get("updates", {})
+    updated_range = updates.get("updatedRange", range_name)
+    updated_rows = updates.get("updatedRows", 0)
+    updated_cells = updates.get("updatedCells", 0)
+
+    text_output = (
+        f"Successfully appended to '{updated_range}' in spreadsheet {spreadsheet_id} for {user_google_email}. "
+        f"Appended: {updated_rows} rows, {updated_cells} cells."
+    )
+
+    logger.info(
+        f"Successfully appended {updated_rows} rows and {updated_cells} cells for {user_google_email}."
+    )
+    return text_output
+
+
+@server.tool()
 @handle_http_errors("create_spreadsheet", service_type="sheets")
 @require_google_service("sheets", "sheets_write")
 async def create_spreadsheet(
