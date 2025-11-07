@@ -7,7 +7,7 @@ This module provides MCP tools for interacting with Google Sheets API.
 import logging
 import asyncio
 import json
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict, Any
 
 
 from auth.service_decorator import require_google_service
@@ -337,6 +337,139 @@ async def append_sheet_values(
     )
     return text_output
 
+
+@server.tool()
+@handle_http_errors("append_rows_by_headers", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def append_rows_by_headers(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    sheet_name: str,
+    rows: Optional[Union[str, List[Dict[str, Any]]]] = None,
+    value_input_option: str = "USER_ENTERED",
+    write_headers_if_missing: bool = True,
+) -> str:
+    """
+    Appends rows mapped by header names. Ensures appends happen at the end, without
+    overwriting existing data. If the sheet has no headers, optionally creates them
+    from the union of provided row keys. If new keys appear, extends the header row
+    (creating new columns) and maps values accordingly.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        sheet_name (str): Target sheet name. Required.
+        rows (Optional[Union[str, List[Dict[str, Any]]]]): List of row objects keyed by header name.
+            Can be provided as JSON string or Python list. Required.
+        value_input_option (str): "RAW" or "USER_ENTERED". Defaults to "USER_ENTERED".
+        write_headers_if_missing (bool): If True, write headers when sheet is empty. Defaults to True.
+
+    Returns:
+        str: Summary of headers and rows appended.
+    """
+    logger.info(
+        f"[append_rows_by_headers] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Sheet: {sheet_name}"
+    )
+
+    # Parse rows if provided as JSON string
+    if rows is not None and isinstance(rows, str):
+        try:
+            parsed_rows = json.loads(rows)
+            rows = parsed_rows
+            logger.info(
+                f"[append_rows_by_headers] Parsed JSON string to Python list with {len(rows) if isinstance(rows, list) else 0} items"
+            )
+        except json.JSONDecodeError as e:
+            raise Exception(f"Invalid JSON format for rows: {e}")
+
+    if not rows or not isinstance(rows, list):
+        raise Exception("'rows' must be a non-empty list of objects keyed by headers.")
+
+    # Validate list elements are dict-like
+    for i, item in enumerate(rows):
+        if not isinstance(item, dict):
+            raise Exception(f"Row {i} must be an object keyed by header names.")
+
+    # 1) Read existing header row
+    header_result = await asyncio.to_thread(
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!1:1")
+        .execute
+    )
+
+    existing_header_values = header_result.get("values", [])
+    existing_headers: List[str] = existing_header_values[0] if existing_header_values else []
+
+    # 2) Compute union of headers
+    provided_keys: List[str] = []
+    seen = set()
+    for item in rows:
+        for k in item.keys():
+            if k not in seen:
+                seen.add(k)
+                provided_keys.append(k)
+
+    all_headers: List[str] = list(existing_headers) if existing_headers else []
+    for k in provided_keys:
+        if k not in all_headers:
+            all_headers.append(k)
+
+    # 3) If no headers and permitted, or if new headers present, update header row
+    need_write_headers = (not existing_headers and write_headers_if_missing) or (
+        existing_headers and len(all_headers) > len(existing_headers)
+    )
+
+    if need_write_headers:
+        await asyncio.to_thread(
+            service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_name}!1:1",
+                valueInputOption=value_input_option,
+                body={"values": [all_headers]},
+            )
+            .execute
+        )
+        logger.info(
+            f"[append_rows_by_headers] Header row set/extended to {len(all_headers)} columns."
+        )
+
+    if not all_headers:
+        raise Exception(
+            "No headers exist and write_headers_if_missing is False; cannot map rows."
+        )
+
+    # 4) Map input objects to row lists aligned with all_headers
+    values_to_append: List[List[Any]] = []
+    for item in rows:
+        mapped_row = [item.get(h, "") for h in all_headers]
+        values_to_append.append(mapped_row)
+
+    # 5) Append rows at the end of the sheet
+    append_result = await asyncio.to_thread(
+        service.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=spreadsheet_id,
+            range=sheet_name,  # appends after the last non-empty row
+            valueInputOption=value_input_option,
+            insertDataOption="INSERT_ROWS",
+            body={"values": values_to_append},
+        )
+        .execute
+    )
+
+    updates = append_result.get("updates", {})
+    updated_range = updates.get("updatedRange", sheet_name)
+    updated_rows = updates.get("updatedRows", 0)
+    updated_cells = updates.get("updatedCells", 0)
+
+    return (
+        f"Headers: {len(all_headers)} columns. Appended {updated_rows} rows / {updated_cells} cells to '{updated_range}'."
+    )
 
 @server.tool()
 @handle_http_errors("create_spreadsheet", service_type="sheets")
