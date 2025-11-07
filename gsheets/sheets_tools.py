@@ -570,6 +570,178 @@ async def create_sheet(
     return text_output
 
 
+# NEW TOOL: Deduplicate rows by key headers while keeping max/min on another column
+@server.tool()
+@handle_http_errors("deduplicate_rows_by_headers", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def deduplicate_rows_by_headers(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    sheet_name: str,
+    key_headers: Union[str, List[str]],
+    sort_header: str,
+    keep: str = "max",
+    work_on_copy: bool = False,
+    destination_sheet_name: Optional[str] = None,
+) -> str:
+    """
+    Deduplicates rows in a sheet by one or more key headers, keeping the row with
+    the max (or min) value in the specified sort column.
+
+    Fast path based on Sheets server-side operations:
+      1) Sort rows (excluding header) by the sort column (DESC for max, ASC for min)
+      2) Delete duplicates comparing only the key columns (keeps first occurrence)
+
+    Args:
+        user_google_email: The user's Google email address. Required.
+        spreadsheet_id: Spreadsheet ID. Required.
+        sheet_name: Target sheet title. Required.
+        key_headers: Header name or list of header names used as the dedupe key.
+        sort_header: Header name of the column used to choose which row to keep.
+        keep: "max" or "min". Defaults to "max".
+        work_on_copy: If True, duplicates the sheet first and operates on the copy.
+        destination_sheet_name: Optional name for the copied sheet when work_on_copy=True.
+
+    Returns:
+        Summary string indicating the target sheet, operation mode, and columns used.
+    """
+    logger.info(
+        f"[deduplicate_rows_by_headers] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Sheet: {sheet_name}, keep: {keep}, work_on_copy: {work_on_copy}"
+    )
+
+    # Normalize key headers
+    key_headers_list: List[str] = [key_headers] if isinstance(key_headers, str) else list(key_headers)
+    if not key_headers_list:
+        raise Exception("'key_headers' must be a non-empty string or list of strings.")
+
+    keep_normalized = keep.strip().lower()
+    if keep_normalized not in ("max", "min"):
+        raise Exception("'keep' must be either 'max' or 'min'.")
+
+    # 1) Resolve sheetId and grid size
+    spreadsheet = await asyncio.to_thread(
+        service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute
+    )
+
+    sheets = spreadsheet.get("sheets", [])
+    target_sheet = None
+    for s in sheets:
+        if s.get("properties", {}).get("title") == sheet_name:
+            target_sheet = s
+            break
+    if not target_sheet:
+        raise Exception(f"Sheet '{sheet_name}' not found in spreadsheet {spreadsheet_id}.")
+
+    source_sheet_id = target_sheet.get("properties", {}).get("sheetId")
+    grid_props = target_sheet.get("properties", {}).get("gridProperties", {})
+    total_rows = grid_props.get("rowCount", 1000000)
+    total_cols = grid_props.get("columnCount", 26)
+
+    # 2) Read header row to map headers -> column indices
+    header_result = await asyncio.to_thread(
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!1:1")
+        .execute
+    )
+    header_values = header_result.get("values", [])
+    headers: List[str] = header_values[0] if header_values else []
+    if not headers:
+        raise Exception("Header row (row 1) is empty; cannot map header names to columns.")
+
+    def header_to_col_index_or_raise(header_name: str) -> int:
+        try:
+            return headers.index(header_name)
+        except ValueError:
+            raise Exception(f"Header '{header_name}' not found in sheet '{sheet_name}'.")
+
+    sort_col_index = header_to_col_index_or_raise(sort_header)
+    key_col_indices = [header_to_col_index_or_raise(h) for h in key_headers_list]
+
+    # 3) Prepare optional duplicate sheet step
+    effective_sheet_id = source_sheet_id
+    requests: List[Dict[str, Any]] = []
+
+    if work_on_copy:
+        requests.append(
+            {
+                "duplicateSheet": {
+                    "sourceSheetId": source_sheet_id,
+                    "insertSheetIndex": 0,
+                    "newSheetName": destination_sheet_name or f"{sheet_name} (dedup)"
+                }
+            }
+        )
+
+        # Execute duplication first to obtain new sheet id
+        dup_response = await asyncio.to_thread(
+            service.spreadsheets()
+            .batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": requests}
+            )
+            .execute
+        )
+        requests = []
+
+        replies = dup_response.get("replies", [])
+        if not replies or "duplicateSheet" not in replies[0]:
+            raise Exception("Failed to duplicate sheet before deduplication.")
+        effective_sheet_id = replies[0]["duplicateSheet"]["properties"]["sheetId"]
+
+    # 4) Build sort then delete-duplicates requests applied to data rows (exclude header)
+    sort_order = "DESCENDING" if keep_normalized == "max" else "ASCENDING"
+
+    data_range = {
+        "sheetId": effective_sheet_id,
+        "startRowIndex": 1,  # exclude header row
+        "startColumnIndex": 0,
+        "endRowIndex": total_rows,
+        "endColumnIndex": total_cols,
+    }
+
+    requests.append(
+        {
+            "sortRange": {
+                "range": data_range,
+                "sortSpecs": [
+                    {"dimensionIndex": sort_col_index, "sortOrder": sort_order}
+                ],
+            }
+        }
+    )
+
+    comparison_columns = [
+        {
+            "sheetId": effective_sheet_id,
+            "dimension": "COLUMNS",
+            "startIndex": idx,
+            "endIndex": idx + 1,
+        }
+        for idx in key_col_indices
+    ]
+
+    requests.append(
+        {
+            "deleteDuplicates": {
+                "range": data_range,
+                "comparisonColumns": comparison_columns,
+            }
+        }
+    )
+
+    response = await asyncio.to_thread(
+        service.spreadsheets()
+        .batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests})
+        .execute
+    )
+
+    target_title = sheet_name if not work_on_copy else (destination_sheet_name or f"{sheet_name} (dedup)")
+    return (
+        f"Deduplicated sheet '{target_title}' by keys {key_headers_list}, keeping {keep_normalized} of '{sort_header}'."
+    )
+
 # Create comment management tools for sheets
 _comment_tools = create_comment_tools("spreadsheet", "spreadsheet_id")
 
