@@ -449,26 +449,34 @@ async def append_rows_by_headers(
         values_to_append.append(mapped_row)
 
     # 5) Append rows at the end of the sheet
-    append_result = await asyncio.to_thread(
-        service.spreadsheets()
-        .values()
-        .append(
-            spreadsheetId=spreadsheet_id,
-            range=sheet_name,  # appends after the last non-empty row
-            valueInputOption=value_input_option,
-            insertDataOption="INSERT_ROWS",
-            body={"values": values_to_append},
-        )
-        .execute
-    )
+    CHUNK_SIZE = 5000  # rows per append request to avoid large payload timeouts
+    total_rows_appended = 0
+    total_cells_appended = 0
+    last_updated_range = sheet_name
 
-    updates = append_result.get("updates", {})
-    updated_range = updates.get("updatedRange", sheet_name)
-    updated_rows = updates.get("updatedRows", 0)
-    updated_cells = updates.get("updatedCells", 0)
+    for start in range(0, len(values_to_append), CHUNK_SIZE):
+        chunk = values_to_append[start : start + CHUNK_SIZE]
+        append_result = await asyncio.to_thread(
+            service.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=spreadsheet_id,
+                range=sheet_name,  # appends after the last non-empty row
+                valueInputOption=value_input_option,
+                insertDataOption="INSERT_ROWS",
+                includeValuesInResponse=False,
+                body={"values": chunk},
+            )
+            .execute
+        )
+
+        updates = append_result.get("updates", {})
+        last_updated_range = updates.get("updatedRange", last_updated_range)
+        total_rows_appended += updates.get("updatedRows", 0)
+        total_cells_appended += updates.get("updatedCells", 0)
 
     return (
-        f"Headers: {len(all_headers)} columns. Appended {updated_rows} rows / {updated_cells} cells to '{updated_range}'."
+        f"Headers: {len(all_headers)} columns. Appended {total_rows_appended} rows / {total_cells_appended} cells to '{last_updated_range}'."
     )
 
 @server.tool()
