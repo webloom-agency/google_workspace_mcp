@@ -10,7 +10,7 @@ import json
 from typing import List, Optional, Union, Dict, Any
 
 
-from auth.service_decorator import require_google_service
+from auth.service_decorator import require_google_service, require_multiple_services
 from core.server import server
 from core.utils import handle_http_errors
 from core.comments import create_comment_tools
@@ -495,10 +495,12 @@ async def append_rows_by_headers(
 
 @server.tool()
 @handle_http_errors("create_spreadsheet", service_type="sheets")
-@require_google_service("sheets", "sheets_write")
-@require_google_service("drive", "drive_file")
+@require_multiple_services([
+    {"service_type": "sheets", "scopes": "sheets_write", "param_name": "sheets_service"},
+    {"service_type": "drive", "scopes": "drive_file", "param_name": "drive_service"}
+])
 async def create_spreadsheet(
-    service,
+    sheets_service,
     drive_service,
     user_google_email: str,
     title: str,
@@ -539,7 +541,7 @@ async def create_spreadsheet(
         ]
 
     spreadsheet = await asyncio.to_thread(
-        service.spreadsheets().create(body=spreadsheet_body).execute
+        sheets_service.spreadsheets().create(body=spreadsheet_body).execute
     )
 
     spreadsheet_id = spreadsheet.get("spreadsheetId")

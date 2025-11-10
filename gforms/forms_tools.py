@@ -9,7 +9,7 @@ import asyncio
 from typing import Optional, Dict, Any, List
 
 
-from auth.service_decorator import require_google_service
+from auth.service_decorator import require_google_service, require_multiple_services
 from core.server import server
 from core.utils import handle_http_errors
 
@@ -18,10 +18,12 @@ logger = logging.getLogger(__name__)
 
 @server.tool()
 @handle_http_errors("create_form", service_type="forms")
-@require_google_service("forms", "forms")
-@require_google_service("drive", "drive_file")
+@require_multiple_services([
+    {"service_type": "forms", "scopes": "forms", "param_name": "forms_service"},
+    {"service_type": "drive", "scopes": "drive_file", "param_name": "drive_service"}
+])
 async def create_form(
-    service,
+    forms_service,
     drive_service,
     user_google_email: str,
     title: str,
@@ -65,7 +67,7 @@ async def create_form(
         form_body["info"]["document_title"] = document_title
 
     created_form = await asyncio.to_thread(
-        service.forms().create(body=form_body).execute
+        forms_service.forms().create(body=form_body).execute
     )
 
     form_id = created_form.get("formId")

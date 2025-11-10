@@ -278,10 +278,12 @@ async def list_docs_in_folder(
 
 @server.tool()
 @handle_http_errors("create_doc", service_type="docs")
-@require_google_service("docs", "docs_write")
-@require_google_service("drive", "drive_file")
+@require_multiple_services([
+    {"service_type": "docs", "scopes": "docs_write", "param_name": "docs_service"},
+    {"service_type": "drive", "scopes": "drive_file", "param_name": "drive_service"}
+])
 async def create_doc(
-    service,
+    docs_service,
     drive_service,
     user_google_email: str,
     title: str,
@@ -310,11 +312,11 @@ async def create_doc(
     """
     logger.info(f"[create_doc] Invoked. Email: '{user_google_email}', Title='{title}'")
 
-    doc = await asyncio.to_thread(service.documents().create(body={'title': title}).execute)
+    doc = await asyncio.to_thread(docs_service.documents().create(body={'title': title}).execute)
     doc_id = doc.get('documentId')
     if content:
         requests = [{'insertText': {'location': {'index': 1}, 'text': content}}]
-        await asyncio.to_thread(service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute)
+        await asyncio.to_thread(docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute)
     
     # Handle folder placement
     folder_info = ""
