@@ -499,3 +499,118 @@ async def check_drive_file_public_access(
         ])
     
     return "\n".join(output_parts)
+
+
+@server.tool()
+@handle_http_errors("share_drive_file", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def share_drive_file(
+    service,
+    user_google_email: str,
+    file_id: str,
+    email: str,
+    role: str = "writer",
+    send_notification_email: bool = True,
+    email_message: Optional[str] = None,
+) -> str:
+    """
+    Shares a Google Drive file (spreadsheet, doc, slide, or any file) with a specific user by email.
+    
+    Args:
+        user_google_email (str): The user's Google email address (the file owner). Required.
+        file_id (str): The ID of the file to share (works with spreadsheet_id, document_id, presentation_id, or any file_id). Required.
+        email (str): The email address of the user to share with. Required.
+        role (str): The role to grant. Options: "reader" (viewer), "commenter", "writer" (editor), "owner". Defaults to "writer".
+        send_notification_email (bool): Whether to send a notification email to the recipient. Defaults to True.
+        email_message (Optional[str]): Optional custom message to include in the notification email.
+    
+    Returns:
+        str: Confirmation message of the successful sharing operation with permission details.
+    """
+    logger.info(f"[share_drive_file] Invoked. File ID: {file_id}, Share with: {email}, Role: {role}")
+    
+    # Validate role
+    valid_roles = ["reader", "commenter", "writer", "owner"]
+    if role.lower() not in valid_roles:
+        raise Exception(f"Invalid role '{role}'. Must be one of: {', '.join(valid_roles)}")
+    
+    # Get file metadata first to show what's being shared
+    file_metadata = await asyncio.to_thread(
+        service.files().get(
+            fileId=file_id,
+            fields="id, name, mimeType, webViewLink",
+            supportsAllDrives=True
+        ).execute
+    )
+    
+    file_name = file_metadata.get("name", "Unknown")
+    mime_type = file_metadata.get("mimeType", "Unknown")
+    web_link = file_metadata.get("webViewLink", "N/A")
+    
+    # Create the permission
+    permission_body = {
+        "type": "user",
+        "role": role.lower(),
+        "emailAddress": email
+    }
+    
+    # Build the create request
+    create_params = {
+        "fileId": file_id,
+        "body": permission_body,
+        "fields": "id, type, role, emailAddress",
+        "supportsAllDrives": True,
+        "sendNotificationEmail": send_notification_email
+    }
+    
+    if email_message and send_notification_email:
+        create_params["emailMessage"] = email_message
+    
+    try:
+        # Create the permission
+        permission = await asyncio.to_thread(
+            service.permissions().create(**create_params).execute
+        )
+        
+        permission_id = permission.get("id")
+        granted_role = permission.get("role")
+        
+        # Format the response
+        file_type = mime_type.split('.')[-1] if 'google-apps' in mime_type else mime_type
+        
+        output_parts = [
+            f"✅ Successfully shared file with {email}",
+            "",
+            f"File: {file_name}",
+            f"Type: {file_type}",
+            f"File ID: {file_id}",
+            f"Permission ID: {permission_id}",
+            "",
+            f"Granted Role: {granted_role}",
+            f"Email Notification Sent: {'Yes' if send_notification_email else 'No'}",
+        ]
+        
+        if email_message and send_notification_email:
+            output_parts.append(f"Custom Message: {email_message}")
+        
+        output_parts.extend([
+            "",
+            f"Link: {web_link}"
+        ])
+        
+        logger.info(f"Successfully shared file {file_id} with {email} as {granted_role}")
+        return "\n".join(output_parts)
+        
+    except Exception as e:
+        logger.error(f"Error sharing file: {e}")
+        error_msg = str(e)
+        
+        # Provide helpful error messages for common issues
+        if "notFound" in error_msg:
+            return f"❌ Error: File with ID '{file_id}' not found or you don't have permission to share it."
+        elif "invalidSharingRequest" in error_msg:
+            return f"❌ Error: Cannot share with '{email}'. The email may be invalid or sharing restrictions may apply."
+        elif "sharingRateLimitExceeded" in error_msg:
+            return f"❌ Error: Sharing rate limit exceeded. Please try again later."
+        else:
+            raise

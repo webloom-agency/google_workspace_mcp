@@ -449,31 +449,45 @@ async def append_rows_by_headers(
         values_to_append.append(mapped_row)
 
     # 5) Append rows at the end of the sheet
-    CHUNK_SIZE = 5000  # rows per append request to avoid large payload timeouts
+    # Determine next available row by scanning column A
+    col_a_values = await asyncio.to_thread(
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A:A", majorDimension="ROWS")
+        .execute
+    )
+    existing_rows = len(col_a_values.get("values", [])) if col_a_values.get("values") else 0
+    # If sheet has headers, existing_rows >= 1; next_row is existing_rows + 1
+    next_row = max(1, existing_rows + 1)
+
+    CHUNK_SIZE = 5000  # rows per request to avoid large payload timeouts
     total_rows_appended = 0
     total_cells_appended = 0
-    last_updated_range = sheet_name
+    last_updated_range = f"{sheet_name}!A{next_row}"
 
     for start in range(0, len(values_to_append), CHUNK_SIZE):
         chunk = values_to_append[start : start + CHUNK_SIZE]
-        append_result = await asyncio.to_thread(
+        # Compute the A1 range for this chunk starting row
+        start_row_for_chunk = next_row + total_rows_appended
+        target_range = f"{sheet_name}!A{start_row_for_chunk}"
+
+        update_result = await asyncio.to_thread(
             service.spreadsheets()
             .values()
-            .append(
+            .update(
                 spreadsheetId=spreadsheet_id,
-                range=sheet_name,  # appends after the last non-empty row
+                range=target_range,
                 valueInputOption=value_input_option,
-                insertDataOption="INSERT_ROWS",
-                includeValuesInResponse=False,
                 body={"values": chunk},
             )
             .execute
         )
 
-        updates = append_result.get("updates", {})
-        last_updated_range = updates.get("updatedRange", last_updated_range)
-        total_rows_appended += updates.get("updatedRows", 0)
-        total_cells_appended += updates.get("updatedCells", 0)
+        updated_rows = update_result.get("updatedRows", len(chunk))
+        updated_cells = update_result.get("updatedCells", len(chunk) * len(all_headers))
+        total_rows_appended += updated_rows
+        total_cells_appended += updated_cells
+        last_updated_range = update_result.get("updatedRange", target_range)
 
     return (
         f"Headers: {len(all_headers)} columns. Appended {total_rows_appended} rows / {total_cells_appended} cells to '{last_updated_range}'."
