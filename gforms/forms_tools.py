@@ -6,7 +6,7 @@ This module provides MCP tools for interacting with Google Forms API.
 
 import logging
 import asyncio
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 from auth.service_decorator import require_google_service
