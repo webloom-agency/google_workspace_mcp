@@ -552,6 +552,17 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
     """
 
     def decorator(func: Callable) -> Callable:
+        # Get the original function signature
+        original_sig = inspect.signature(func)
+        original_params = list(original_sig.parameters.values())
+        
+        # Extract service parameter names that should be excluded from the wrapper signature
+        service_param_names = [config["param_name"] for config in service_configs]
+        
+        # Create a new signature excluding service parameters
+        wrapper_params = [p for p in original_params if p.name not in service_param_names]
+        wrapper_sig = original_sig.replace(parameters=wrapper_params)
+        
         @wraps(func)
         async def wrapper(*args, **kwargs):
             # Extract user_google_email
@@ -642,6 +653,8 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
                 )
                 raise Exception(error_message)
 
+        # Apply the modified signature to the wrapper so MCP sees the correct parameters
+        wrapper.__signature__ = wrapper_sig
         return wrapper
 
     return decorator
