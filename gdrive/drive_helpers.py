@@ -4,6 +4,7 @@ Google Drive Helper Functions
 Shared utilities for Google Drive operations including permission checking.
 """
 import re
+import asyncio
 from typing import List, Dict, Any, Optional
 
 
@@ -109,3 +110,263 @@ def build_drive_list_params(
         list_params["corpora"] = corpora
 
     return list_params
+
+
+async def find_folder_by_name_pattern(
+    service,
+    name_pattern: str,
+    exact_match: bool = False,
+    user_email: Optional[str] = None,
+    parent_folder_id: Optional[str] = None,
+) -> Optional[Dict[str, str]]:
+    """
+    Search for a folder by name pattern (case-insensitive contains by default).
+    Returns the most recently modified matching folder.
+    
+    Args:
+        service: Google Drive service instance
+        name_pattern: String to search for in folder names
+        exact_match: If True, requires exact name match (case-insensitive)
+        user_email: Optional user email for logging
+        parent_folder_id: Optional parent folder ID to search within (recursive). If None, searches all Drive.
+        
+    Returns:
+        Dict with 'id', 'name', and 'webViewLink' of the folder, or None if not found
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # Escape single quotes in the pattern
+    escaped_pattern = name_pattern.replace("'", "\\'")
+    
+    # Build the base query for folder name matching
+    if exact_match:
+        query = f"mimeType='application/vnd.google-apps.folder' and name='{escaped_pattern}' and trashed=false"
+    else:
+        query = f"mimeType='application/vnd.google-apps.folder' and name contains '{escaped_pattern}' and trashed=false"
+    
+    # Add parent folder constraint if specified (this searches recursively)
+    if parent_folder_id:
+        escaped_parent_id = parent_folder_id.replace("'", "\\'")
+        query += f" and '{escaped_parent_id}' in parents"
+        logger.info(f"[find_folder_by_name_pattern] Searching for folder with pattern: '{name_pattern}' within parent folder: {parent_folder_id} (exact={exact_match})")
+    else:
+        logger.info(f"[find_folder_by_name_pattern] Searching for folder with pattern: '{name_pattern}' across all Drive (exact={exact_match})")
+    
+    try:
+        results = await asyncio.to_thread(
+            service.files().list(
+                q=query,
+                pageSize=10,
+                fields="files(id, name, webViewLink, modifiedTime, parents)",
+                orderBy="modifiedTime desc",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute
+        )
+        
+        folders = results.get('files', [])
+        
+        if not folders:
+            search_scope = f"within parent {parent_folder_id}" if parent_folder_id else "in all Drive"
+            logger.warning(f"[find_folder_by_name_pattern] No folders found matching '{name_pattern}' {search_scope}")
+            return None
+        
+        # Return the most recently modified folder (first in list due to orderBy)
+        best_match = folders[0]
+        logger.info(f"[find_folder_by_name_pattern] Found folder: '{best_match['name']}' (ID: {best_match['id']})")
+        
+        if len(folders) > 1:
+            logger.info(f"[find_folder_by_name_pattern] Found {len(folders)} matching folders, using most recent")
+        
+        return {
+            'id': best_match['id'],
+            'name': best_match['name'],
+            'webViewLink': best_match.get('webViewLink', '')
+        }
+        
+    except Exception as e:
+        logger.error(f"[find_folder_by_name_pattern] Error searching for folder: {e}")
+        return None
+
+
+async def move_file_to_folder(
+    service,
+    file_id: str,
+    folder_id: str,
+    file_name: Optional[str] = None,
+) -> bool:
+    """
+    Move a file to a specific folder in Google Drive.
+    
+    Args:
+        service: Google Drive service instance
+        file_id: ID of the file to move
+        folder_id: ID of the destination folder
+        file_name: Optional file name for logging
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"[move_file_to_folder] Moving file {file_id} to folder {folder_id}")
+    
+    try:
+        # Get current parents
+        file = await asyncio.to_thread(
+            service.files().get(
+                fileId=file_id,
+                fields='parents',
+                supportsAllDrives=True
+            ).execute
+        )
+        
+        previous_parents = ",".join(file.get('parents', []))
+        
+        # Move the file to the new folder
+        await asyncio.to_thread(
+            service.files().update(
+                fileId=file_id,
+                addParents=folder_id,
+                removeParents=previous_parents,
+                fields='id, parents',
+                supportsAllDrives=True
+            ).execute
+        )
+        
+        logger.info(f"[move_file_to_folder] Successfully moved file to folder {folder_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"[move_file_to_folder] Error moving file: {e}")
+        return False
+
+
+async def create_folder(
+    service,
+    folder_name: str,
+    parent_folder_id: Optional[str] = None,
+) -> Optional[Dict[str, str]]:
+    """
+    Create a new folder in Google Drive.
+    
+    Args:
+        service: Google Drive service instance
+        folder_name: Name of the folder to create
+        parent_folder_id: Optional parent folder ID. If None, creates in My Drive root.
+        
+    Returns:
+        Dict with 'id', 'name', and 'webViewLink' of the created folder, or None if failed
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"[create_folder] Creating folder '{folder_name}' in parent {parent_folder_id or 'root'}")
+    
+    try:
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        
+        if parent_folder_id:
+            file_metadata['parents'] = [parent_folder_id]
+        
+        folder = await asyncio.to_thread(
+            service.files().create(
+                body=file_metadata,
+                fields='id, name, webViewLink',
+                supportsAllDrives=True
+            ).execute
+        )
+        
+        logger.info(f"[create_folder] Successfully created folder '{folder_name}' (ID: {folder['id']})")
+        
+        return {
+            'id': folder['id'],
+            'name': folder['name'],
+            'webViewLink': folder.get('webViewLink', '')
+        }
+        
+    except Exception as e:
+        logger.error(f"[create_folder] Error creating folder: {e}")
+        return None
+
+
+async def find_or_create_folder_path(
+    service,
+    folder_path: List[str],
+    root_folder_id: Optional[str] = None,
+    create_missing: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """
+    Navigate through a folder path (e.g., ["CLIENTS", "xxx.fr", "SEO"]) by searching for each folder.
+    Creates missing folders if create_missing is True.
+    
+    Args:
+        service: Google Drive service instance
+        folder_path: List of folder name patterns to navigate through (in order)
+        root_folder_id: Optional starting folder ID. If None, starts from My Drive root.
+        create_missing: If True, creates folders that don't exist. If False, returns None if path doesn't exist.
+        
+    Returns:
+        Dict with 'id', 'name', 'webViewLink', and 'path_summary' of the final folder, or None if failed
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    if not folder_path:
+        logger.warning("[find_or_create_folder_path] Empty folder path provided")
+        return None
+    
+    logger.info(f"[find_or_create_folder_path] Navigating path: {' > '.join(folder_path)} (create_missing={create_missing})")
+    
+    current_parent_id = root_folder_id
+    path_summary = []
+    
+    for i, folder_name_pattern in enumerate(folder_path):
+        # Try to find existing folder
+        folder = await find_folder_by_name_pattern(
+            service,
+            folder_name_pattern,
+            exact_match=False,
+            parent_folder_id=current_parent_id
+        )
+        
+        if folder:
+            logger.info(f"[find_or_create_folder_path] Found existing folder: '{folder['name']}' (ID: {folder['id']})")
+            path_summary.append(f"{folder['name']}")
+            current_parent_id = folder['id']
+        elif create_missing:
+            # Create the folder
+            logger.info(f"[find_or_create_folder_path] Folder '{folder_name_pattern}' not found, creating it...")
+            new_folder = await create_folder(
+                service,
+                folder_name_pattern,
+                parent_folder_id=current_parent_id
+            )
+            
+            if not new_folder:
+                logger.error(f"[find_or_create_folder_path] Failed to create folder '{folder_name_pattern}'")
+                return None
+            
+            logger.info(f"[find_or_create_folder_path] Created folder: '{new_folder['name']}' (ID: {new_folder['id']})")
+            path_summary.append(f"{new_folder['name']} (created)")
+            current_parent_id = new_folder['id']
+            folder = new_folder
+        else:
+            logger.warning(f"[find_or_create_folder_path] Folder '{folder_name_pattern}' not found and create_missing=False")
+            return None
+    
+    # Return the final folder in the path
+    final_folder_info = {
+        'id': current_parent_id,
+        'name': folder['name'],
+        'webViewLink': folder.get('webViewLink', ''),
+        'path_summary': ' > '.join(path_summary)
+    }
+    
+    logger.info(f"[find_or_create_folder_path] Successfully navigated to: {final_folder_info['path_summary']}")
+    return final_folder_info

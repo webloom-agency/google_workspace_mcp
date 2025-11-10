@@ -6,7 +6,7 @@ This module provides MCP tools for interacting with Google Slides API.
 
 import logging
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 from auth.service_decorator import require_google_service
@@ -20,17 +20,29 @@ logger = logging.getLogger(__name__)
 @server.tool()
 @handle_http_errors("create_presentation", service_type="slides")
 @require_google_service("slides", "slides")
+@require_google_service("drive", "drive_file")
 async def create_presentation(
     service,
+    drive_service,
     user_google_email: str,
-    title: str = "Untitled Presentation"
+    title: str = "Untitled Presentation",
+    folder_id: Optional[str] = None,
+    folder_name_contains: Optional[str] = None,
+    search_within_folder_id: Optional[str] = None,
+    folder_path: Optional[List[str]] = None,
+    create_folders_if_missing: bool = True,
 ) -> str:
     """
-    Create a new Google Slides presentation.
+    Create a new Google Slides presentation, optionally in a specific folder.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         title (str): The title for the new presentation. Defaults to "Untitled Presentation".
+        folder_id (Optional[str]): Specific folder ID to place the presentation in.
+        folder_name_contains (Optional[str]): Search for folder name containing this string. Uses the most recently modified match.
+        search_within_folder_id (Optional[str]): When using folder_name_contains, limit search to within this parent folder. If not specified, searches all Drive.
+        folder_path (Optional[List[str]]): Navigate through nested folders by name patterns (e.g., ["CLIENTS", "xxx.fr", "SEO"]). Searches for each folder in order, creating missing ones if create_folders_if_missing is True.
+        create_folders_if_missing (bool): When using folder_path, create folders that don't exist. Defaults to True.
 
     Returns:
         str: Details about the created presentation including ID and URL.
@@ -47,12 +59,60 @@ async def create_presentation(
 
     presentation_id = result.get('presentationId')
     presentation_url = f"https://docs.google.com/presentation/d/{presentation_id}/edit"
+    
+    # Handle folder placement
+    folder_info = ""
+    target_folder_id = folder_id
+    
+    # Priority 1: folder_path (navigate through nested folders)
+    if folder_path and not folder_id:
+        from gdrive.drive_helpers import find_or_create_folder_path
+        folder_result = await find_or_create_folder_path(
+            drive_service,
+            folder_path,
+            root_folder_id=search_within_folder_id,
+            create_missing=create_folders_if_missing
+        )
+        if folder_result:
+            target_folder_id = folder_result['id']
+            folder_info = f"\n- Path: {folder_result['path_summary']}"
+        else:
+            folder_info = f"\n- Warning: Could not navigate folder path {' > '.join(folder_path)}, created in My Drive"
+    
+    # Priority 2: folder_name_contains (simple search)
+    elif folder_name_contains and not folder_id:
+        from gdrive.drive_helpers import find_folder_by_name_pattern
+        folder = await find_folder_by_name_pattern(
+            drive_service,
+            folder_name_contains,
+            exact_match=False,
+            user_email=user_google_email,
+            parent_folder_id=search_within_folder_id
+        )
+        if folder:
+            target_folder_id = folder['id']
+            search_scope = f" within folder {search_within_folder_id}" if search_within_folder_id else ""
+            folder_info = f"\n- Folder: '{folder['name']}' ({folder['id']}){search_scope}"
+        else:
+            search_scope = f" within folder {search_within_folder_id}" if search_within_folder_id else " in all Drive"
+            folder_info = f"\n- Warning: No folder found matching '{folder_name_contains}'{search_scope}, created in My Drive"
+    
+    if target_folder_id:
+        from gdrive.drive_helpers import move_file_to_folder
+        move_success = await move_file_to_folder(
+            drive_service,
+            presentation_id,
+            target_folder_id,
+            file_name=title
+        )
+        if move_success and not folder_info:
+            folder_info = f"\n- Moved to folder: {target_folder_id}"
 
     confirmation_message = f"""Presentation Created Successfully for {user_google_email}:
 - Title: {title}
 - Presentation ID: {presentation_id}
 - URL: {presentation_url}
-- Slides: {len(result.get('slides', []))} slide(s) created"""
+- Slides: {len(result.get('slides', []))} slide(s) created{folder_info}"""
 
     logger.info(f"Presentation created successfully for {user_google_email}")
     return confirmation_message
