@@ -510,7 +510,7 @@ async def share_drive_file(
     file_id: str,
     email: str,
     role: str = "writer",
-    send_notification_email: bool = True,
+    send_notification_email: bool = False,
     email_message: Optional[str] = None,
 ) -> str:
     """
@@ -521,8 +521,8 @@ async def share_drive_file(
         file_id (str): The ID of the file to share (works with spreadsheet_id, document_id, presentation_id, or any file_id). Required.
         email (str): The email address of the user to share with. Required.
         role (str): The role to grant. Options: "reader" (viewer), "commenter", "writer" (editor), "owner". Defaults to "writer".
-        send_notification_email (bool): Whether to send a notification email to the recipient. Defaults to True.
-        email_message (Optional[str]): Optional custom message to include in the notification email.
+        send_notification_email (bool): Whether to send a notification email to the recipient. Defaults to False (no email sent).
+        email_message (Optional[str]): Optional custom message to include in the notification email (only used if send_notification_email is True).
     
     Returns:
         str: Confirmation message of the successful sharing operation with permission details.
