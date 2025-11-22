@@ -284,29 +284,91 @@ async def modify_sheet_values(
         # Fix incorrectly encoded UTF-8 characters (e.g., c3a9 → é)
         values = fix_encoding_recursive(values)
         
-        body = {"values": values}
+        # Chunking for large datasets to avoid timeouts and size limits
+        CHUNK_SIZE = 5000  # rows per request
+        total_rows = len(values)
+        
+        # For small datasets, use single update call (more efficient)
+        if total_rows <= CHUNK_SIZE:
+            body = {"values": values}
 
-        result = await asyncio.to_thread(
-            service.spreadsheets()
-            .values()
-            .update(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
-                valueInputOption=value_input_option,
-                body=body,
+            result = await asyncio.to_thread(
+                service.spreadsheets()
+                .values()
+                .update(
+                    spreadsheetId=spreadsheet_id,
+                    range=range_name,
+                    valueInputOption=value_input_option,
+                    body=body,
+                )
+                .execute
             )
-            .execute
-        )
 
-        updated_cells = result.get("updatedCells", 0)
-        updated_rows = result.get("updatedRows", 0)
-        updated_columns = result.get("updatedColumns", 0)
+            updated_cells = result.get("updatedCells", 0)
+            updated_rows = result.get("updatedRows", 0)
+            updated_columns = result.get("updatedColumns", 0)
 
-        text_output = (
-            f"Successfully updated range '{range_name}' in spreadsheet {spreadsheet_id} for {user_google_email}. "
-            f"Updated: {updated_cells} cells, {updated_rows} rows, {updated_columns} columns."
-        )
-        logger.info(f"Successfully updated {updated_cells} cells for {user_google_email}.")
+            text_output = (
+                f"Successfully updated range '{range_name}' in spreadsheet {spreadsheet_id} for {user_google_email}. "
+                f"Updated: {updated_cells} cells, {updated_rows} rows, {updated_columns} columns."
+            )
+            logger.info(f"Successfully updated {updated_cells} cells for {user_google_email}.")
+        else:
+            # For large datasets, chunk the data
+            logger.info(f"[modify_sheet_values] Large dataset detected ({total_rows} rows). Using chunked update.")
+            
+            # Parse the range to get sheet name and starting position
+            # Format: "Sheet1!A1:Z100" or "A1:Z100"
+            import re
+            range_match = re.match(r"(?:([^!]+)!)?([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?", range_name)
+            if not range_match:
+                raise Exception(f"Invalid range format: {range_name}. Expected format: 'Sheet1!A1' or 'A1:Z100'")
+            
+            sheet_prefix = range_match.group(1)
+            start_col = range_match.group(2)
+            start_row = int(range_match.group(3))
+            
+            total_cells_updated = 0
+            total_rows_updated = 0
+            total_columns = len(values[0]) if values else 0
+            
+            for chunk_idx, chunk_start in enumerate(range(0, total_rows, CHUNK_SIZE)):
+                chunk = values[chunk_start : chunk_start + CHUNK_SIZE]
+                chunk_num = chunk_idx + 1
+                total_chunks = (total_rows + CHUNK_SIZE - 1) // CHUNK_SIZE
+                
+                # Calculate the range for this chunk
+                chunk_start_row = start_row + chunk_start
+                chunk_end_row = chunk_start_row + len(chunk) - 1
+                
+                if sheet_prefix:
+                    chunk_range = f"{sheet_prefix}!{start_col}{chunk_start_row}"
+                else:
+                    chunk_range = f"{start_col}{chunk_start_row}"
+                
+                logger.info(f"[modify_sheet_values] Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} rows, range: {chunk_range})")
+                
+                body = {"values": chunk}
+                result = await asyncio.to_thread(
+                    service.spreadsheets()
+                    .values()
+                    .update(
+                        spreadsheetId=spreadsheet_id,
+                        range=chunk_range,
+                        valueInputOption=value_input_option,
+                        body=body,
+                    )
+                    .execute
+                )
+                
+                total_cells_updated += result.get("updatedCells", 0)
+                total_rows_updated += result.get("updatedRows", 0)
+            
+            text_output = (
+                f"Successfully updated range '{range_name}' in spreadsheet {spreadsheet_id} for {user_google_email}. "
+                f"Updated: {total_cells_updated} cells, {total_rows_updated} rows, {total_columns} columns in {total_chunks} chunks."
+            )
+            logger.info(f"Successfully updated {total_cells_updated} cells for {user_google_email} in {total_chunks} chunks.")
 
     return text_output
 
