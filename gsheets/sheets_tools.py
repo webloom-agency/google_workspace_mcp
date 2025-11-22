@@ -365,33 +365,83 @@ async def append_sheet_values(
     # Fix incorrectly encoded UTF-8 characters (e.g., c3a9 → é)
     values = fix_encoding_recursive(values)
 
-    body = {"values": values}
-
-    result = await asyncio.to_thread(
-        service.spreadsheets()
-        .values()
-        .append(
-            spreadsheetId=spreadsheet_id,
-            range=range_name,
-            valueInputOption=value_input_option,
-            insertDataOption=insert_data_option,
-            body=body,
+    # Chunking for large datasets to avoid timeouts and size limits
+    CHUNK_SIZE = 5000  # rows per request
+    total_rows = len(values)
+    
+    # For small datasets, use single append call (more efficient)
+    if total_rows <= CHUNK_SIZE:
+        body = {"values": values}
+        result = await asyncio.to_thread(
+            service.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=spreadsheet_id,
+                range=range_name,
+                valueInputOption=value_input_option,
+                insertDataOption=insert_data_option,
+                body=body,
+            )
+            .execute
         )
-        .execute
-    )
 
-    updates = result.get("updates", {})
-    updated_range = updates.get("updatedRange", range_name)
-    updated_rows = updates.get("updatedRows", 0)
-    updated_cells = updates.get("updatedCells", 0)
+        updates = result.get("updates", {})
+        updated_range = updates.get("updatedRange", range_name)
+        updated_rows = updates.get("updatedRows", 0)
+        updated_cells = updates.get("updatedCells", 0)
 
+        text_output = (
+            f"Successfully appended to '{updated_range}' in spreadsheet {spreadsheet_id} for {user_google_email}. "
+            f"Appended: {updated_rows} rows, {updated_cells} cells."
+        )
+
+        logger.info(
+            f"Successfully appended {updated_rows} rows and {updated_cells} cells for {user_google_email}."
+        )
+        return text_output
+    
+    # For large datasets, chunk the data
+    logger.info(f"[append_sheet_values] Large dataset detected ({total_rows} rows). Using chunked append.")
+    
+    total_rows_appended = 0
+    total_cells_appended = 0
+    last_updated_range = range_name
+    
+    for chunk_idx, start in enumerate(range(0, total_rows, CHUNK_SIZE)):
+        chunk = values[start : start + CHUNK_SIZE]
+        chunk_num = chunk_idx + 1
+        total_chunks = (total_rows + CHUNK_SIZE - 1) // CHUNK_SIZE
+        
+        logger.info(f"[append_sheet_values] Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} rows)")
+        
+        body = {"values": chunk}
+        result = await asyncio.to_thread(
+            service.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=spreadsheet_id,
+                range=range_name,
+                valueInputOption=value_input_option,
+                insertDataOption=insert_data_option,
+                body=body,
+            )
+            .execute
+        )
+        
+        updates = result.get("updates", {})
+        updated_rows = updates.get("updatedRows", 0)
+        updated_cells = updates.get("updatedCells", 0)
+        total_rows_appended += updated_rows
+        total_cells_appended += updated_cells
+        last_updated_range = updates.get("updatedRange", last_updated_range)
+    
     text_output = (
-        f"Successfully appended to '{updated_range}' in spreadsheet {spreadsheet_id} for {user_google_email}. "
-        f"Appended: {updated_rows} rows, {updated_cells} cells."
+        f"Successfully appended to '{last_updated_range}' in spreadsheet {spreadsheet_id} for {user_google_email}. "
+        f"Appended: {total_rows_appended} rows, {total_cells_appended} cells in {total_chunks} chunks."
     )
 
     logger.info(
-        f"Successfully appended {updated_rows} rows and {updated_cells} cells for {user_google_email}."
+        f"Successfully appended {total_rows_appended} rows and {total_cells_appended} cells for {user_google_email} in {total_chunks} chunks."
     )
     return text_output
 
