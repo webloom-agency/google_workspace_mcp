@@ -228,7 +228,7 @@ async def modify_sheet_values(
     user_google_email: str,
     spreadsheet_id: str,
     range_name: str,
-    values: Optional[Union[str, List[List[str]]]] = None,
+    values: Optional[Union[str, List[List[Any]]]] = None,
     value_input_option: str = "USER_ENTERED",
     clear_values: bool = False,
 ) -> str:
@@ -239,7 +239,7 @@ async def modify_sheet_values(
         user_google_email (str): The user's Google email address. Required.
         spreadsheet_id (str): The ID of the spreadsheet. Required.
         range_name (str): The range to modify (e.g., "Sheet1!A1:D10", "A1:D10"). Required.
-        values (Optional[Union[str, List[List[str]]]]): 2D array of values to write/update. Can be a JSON string or Python list. Required unless clear_values=True.
+        values (Optional[Union[str, List[List[Any]]]]): 2D array of values to write/update. Can be a JSON string or Python list. Accepts any data types (strings, numbers, booleans, null). Required unless clear_values=True.
         value_input_option (str): How to interpret input values ("RAW" or "USER_ENTERED"). Defaults to "USER_ENTERED".
         clear_values (bool): If True, clears the range instead of writing values. Defaults to False.
 
@@ -319,7 +319,7 @@ async def append_sheet_values(
     user_google_email: str,
     spreadsheet_id: str,
     range_name: str,
-    values: Optional[Union[str, List[List[str]]]] = None,
+    values: Optional[Union[str, List[List[Any]]]] = None,
     value_input_option: str = "USER_ENTERED",
     insert_data_option: str = "INSERT_ROWS",
 ) -> str:
@@ -330,7 +330,7 @@ async def append_sheet_values(
         user_google_email (str): The user's Google email address. Required.
         spreadsheet_id (str): The ID of the spreadsheet. Required.
         range_name (str): The target range or sheet (e.g., "Sheet1", "Sheet1!A1"). Required.
-        values (Optional[Union[str, List[List[str]]]]): 2D array of values to append. Can be a JSON string or Python list.
+        values (Optional[Union[str, List[List[Any]]]]): 2D array of values to append. Can be a JSON string or Python list. Accepts any data types (strings, numbers, booleans, null).
         value_input_option (str): How to interpret input values ("RAW" or "USER_ENTERED"). Defaults to "USER_ENTERED".
         insert_data_option (str): How to insert the data ("OVERWRITE" or "INSERT_ROWS"). Defaults to "INSERT_ROWS".
 
