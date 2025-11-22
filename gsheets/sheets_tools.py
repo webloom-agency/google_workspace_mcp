@@ -7,6 +7,7 @@ This module provides MCP tools for interacting with Google Sheets API.
 import logging
 import asyncio
 import json
+import re
 from typing import List, Optional, Union, Dict, Any
 
 
@@ -17,6 +18,57 @@ from core.comments import create_comment_tools
 
 # Configure module logger
 logger = logging.getLogger(__name__)
+
+
+def fix_utf8_encoding(text: str) -> str:
+    """
+    Fix incorrectly encoded UTF-8 characters that appear as lowercase hex bytes.
+    E.g., "stratc3a9gie" → "stratégie" (c3a9 is UTF-8 for é)
+    
+    This handles the case where UTF-8 byte sequences are written as hex without percent signs.
+    Common pattern: c3a9 (é), c3a0 (à), c3a7 (ç), c3a8 (è), c3b4 (ô), etc.
+    """
+    if not isinstance(text, str) or 'c' not in text.lower():
+        return text
+    
+    try:
+        # Pattern: match sequences like c3a9, c2b7, etc (UTF-8 byte pairs as hex)
+        # UTF-8 multi-byte sequences start with c2-f4 followed by 80-bf
+        pattern = r'c([2-3][0-9a-f]{3})|c([4-9a-f][0-9a-f]{3})|e([0-9a-f]{5})|f([0-9a-f]{7})'
+        
+        def replace_hex(match):
+            hex_str = match.group(0)
+            # Add % signs to make it proper URL encoding
+            hex_with_percent = ''.join(f'%{hex_str[i:i+2].upper()}' for i in range(0, len(hex_str), 2))
+            try:
+                # Decode the URL-encoded UTF-8
+                import urllib.parse
+                decoded = urllib.parse.unquote(hex_with_percent)
+                return decoded
+            except:
+                return hex_str
+        
+        result = re.sub(pattern, replace_hex, text, flags=re.IGNORECASE)
+        if result != text:
+            logger.debug(f"[fix_utf8_encoding] Fixed encoding: '{text[:50]}...' → '{result[:50]}...'")
+        return result
+    except Exception as e:
+        logger.warning(f"[fix_utf8_encoding] Error fixing encoding: {e}")
+        return text
+
+
+def fix_encoding_recursive(data: Any) -> Any:
+    """
+    Recursively fix UTF-8 encoding in all string values within nested structures.
+    """
+    if isinstance(data, str):
+        return fix_utf8_encoding(data)
+    elif isinstance(data, list):
+        return [fix_encoding_recursive(item) for item in data]
+    elif isinstance(data, dict):
+        return {key: fix_encoding_recursive(value) for key, value in data.items()}
+    else:
+        return data
 
 
 @server.tool()
@@ -229,6 +281,9 @@ async def modify_sheet_values(
         text_output = f"Successfully cleared range '{cleared_range}' in spreadsheet {spreadsheet_id} for {user_google_email}."
         logger.info(f"Successfully cleared range '{cleared_range}' for {user_google_email}.")
     else:
+        # Fix incorrectly encoded UTF-8 characters (e.g., c3a9 → é)
+        values = fix_encoding_recursive(values)
+        
         body = {"values": values}
 
         result = await asyncio.to_thread(
@@ -306,6 +361,9 @@ async def append_sheet_values(
 
     if not values:
         raise Exception("'values' must be provided and be a non-empty 2D array.")
+
+    # Fix incorrectly encoded UTF-8 characters (e.g., c3a9 → é)
+    values = fix_encoding_recursive(values)
 
     body = {"values": values}
 
@@ -390,6 +448,9 @@ async def append_rows_by_headers(
     for i, item in enumerate(rows):
         if not isinstance(item, dict):
             raise Exception(f"Row {i} must be an object keyed by header names.")
+
+    # Fix incorrectly encoded UTF-8 characters (e.g., c3a9 → é)
+    rows = fix_encoding_recursive(rows)
 
     # 1) Read existing header row
     header_result = await asyncio.to_thread(
