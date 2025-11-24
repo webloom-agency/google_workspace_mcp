@@ -300,6 +300,44 @@ async def modify_sheet_values(
 
     if not clear_values and not values:
         raise Exception("Either 'values' must be provided or 'clear_values' must be True.")
+    
+    # Flatten any nested lists/arrays within cells and validate structure
+    if not clear_values and values:
+        def flatten_cell_value(value, row_idx: int, col_idx: int):
+            """Convert nested lists/arrays to comma-separated strings, keep primitives as-is."""
+            if isinstance(value, (list, tuple)):
+                logger.warning(
+                    f"[modify_sheet_values] Found nested list at row {row_idx}, column {col_idx}. "
+                    f"Converting to comma-separated string: {value}"
+                )
+                # Recursively flatten and join with commas
+                flattened = []
+                for item in value:
+                    if isinstance(item, (list, tuple)):
+                        flattened.extend(flatten_cell_value(item, row_idx, col_idx))
+                    else:
+                        flattened.append(str(item) if item is not None else "")
+                return ", ".join(flattened)
+            elif isinstance(value, dict):
+                logger.warning(
+                    f"[modify_sheet_values] Found dict at row {row_idx}, column {col_idx}. "
+                    f"Converting to JSON string: {value}"
+                )
+                return json.dumps(value)
+            else:
+                # Primitive value (string, number, boolean, None)
+                return value
+        
+        # Flatten the values array
+        flattened_values = []
+        for i, row in enumerate(values):
+            flattened_row = []
+            for j, cell in enumerate(row):
+                flattened_cell = flatten_cell_value(cell, i, j)
+                flattened_row.append(flattened_cell)
+            flattened_values.append(flattened_row)
+        
+        values = flattened_values
 
     if clear_values:
         result = await asyncio.to_thread(
@@ -456,6 +494,43 @@ async def append_sheet_values(
 
     if not values:
         raise Exception("'values' must be provided and be a non-empty 2D array.")
+    
+    # Flatten any nested lists/arrays within cells and validate structure
+    def flatten_cell_value(value, row_idx: int, col_idx: int):
+        """Convert nested lists/arrays to comma-separated strings, keep primitives as-is."""
+        if isinstance(value, (list, tuple)):
+            logger.warning(
+                f"[append_sheet_values] Found nested list at row {row_idx}, column {col_idx}. "
+                f"Converting to comma-separated string: {value}"
+            )
+            # Recursively flatten and join with commas
+            flattened = []
+            for item in value:
+                if isinstance(item, (list, tuple)):
+                    flattened.extend(flatten_cell_value(item, row_idx, col_idx))
+                else:
+                    flattened.append(str(item) if item is not None else "")
+            return ", ".join(flattened)
+        elif isinstance(value, dict):
+            logger.warning(
+                f"[append_sheet_values] Found dict at row {row_idx}, column {col_idx}. "
+                f"Converting to JSON string: {value}"
+            )
+            return json.dumps(value)
+        else:
+            # Primitive value (string, number, boolean, None)
+            return value
+    
+    # Flatten the values array
+    flattened_values = []
+    for i, row in enumerate(values):
+        flattened_row = []
+        for j, cell in enumerate(row):
+            flattened_cell = flatten_cell_value(cell, i, j)
+            flattened_row.append(flattened_cell)
+        flattened_values.append(flattened_row)
+    
+    values = flattened_values
 
     # Fix incorrectly encoded UTF-8 characters (e.g., c3a9 → é)
     if not DISABLE_UTF8_FIX:
