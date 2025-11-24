@@ -593,7 +593,8 @@ async def append_rows_by_headers(
     need_write_headers = (not existing_headers and write_headers_if_missing) or (
         existing_headers and len(all_headers) > len(existing_headers)
     )
-
+    
+    headers_were_written = False
     if need_write_headers:
         await asyncio.to_thread(
             service.spreadsheets()
@@ -606,6 +607,7 @@ async def append_rows_by_headers(
             )
             .execute
         )
+        headers_were_written = True
         logger.info(
             f"[append_rows_by_headers] Header row set/extended to {len(all_headers)} columns."
         )
@@ -630,6 +632,12 @@ async def append_rows_by_headers(
         .execute
     )
     existing_rows = len(col_a_values.get("values", [])) if col_a_values.get("values") else 0
+    
+    # If we just wrote headers but the read didn't reflect them, account for the header row
+    if headers_were_written and existing_rows == 0:
+        existing_rows = 1
+        logger.info("[append_rows_by_headers] Adjusted existing_rows to 1 to account for just-written headers.")
+    
     # If sheet has headers, existing_rows >= 1; next_row is existing_rows + 1
     next_row = max(1, existing_rows + 1)
 
