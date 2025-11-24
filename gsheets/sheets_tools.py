@@ -19,6 +19,10 @@ from core.comments import create_comment_tools
 # Configure module logger
 logger = logging.getLogger(__name__)
 
+# Environment variable to disable UTF-8 encoding fix if it causes issues
+import os
+DISABLE_UTF8_FIX = os.getenv("DISABLE_UTF8_ENCODING_FIX", "false").lower() == "true"
+
 
 def fix_utf8_encoding(text: str) -> str:
     """
@@ -28,23 +32,38 @@ def fix_utf8_encoding(text: str) -> str:
     This handles the case where UTF-8 byte sequences are written as hex without percent signs.
     Common pattern: c3a9 (é), c3a0 (à), c3a7 (ç), c3a8 (è), c3b4 (ô), etc.
     """
-    if not isinstance(text, str) or 'c' not in text.lower():
+    if not isinstance(text, str):
+        return text
+    
+    # Skip if already has proper percent encoding or looks corrupted
+    if '%' in text or '\ufffd' in text or '��' in text:
+        return text
+    
+    # Only process if it contains the specific malformed hex pattern
+    if not re.search(r'c[2-3][0-9a-f]{3}', text, re.IGNORECASE):
         return text
     
     try:
-        # Pattern: match sequences like c3a9, c2b7, etc (UTF-8 byte pairs as hex)
-        # UTF-8 multi-byte sequences start with c2-f4 followed by 80-bf
-        pattern = r'c([2-3][0-9a-f]{3})|c([4-9a-f][0-9a-f]{3})|e([0-9a-f]{5})|f([0-9a-f]{7})'
+        # Pattern: match ONLY 2-byte UTF-8 sequences that look malformed
+        # c2XX or c3XX (common French accented chars: é, è, à, ç, etc.)
+        pattern = r'c([2-3])([0-9a-f]{2})'
         
         def replace_hex(match):
             hex_str = match.group(0)
+            # Verify this looks like a UTF-8 byte pair
+            byte1 = match.group(1)
+            byte2 = match.group(2)
+            
             # Add % signs to make it proper URL encoding
-            hex_with_percent = ''.join(f'%{hex_str[i:i+2].upper()}' for i in range(0, len(hex_str), 2))
+            hex_with_percent = f'%C{byte1}%{byte2.upper()}'
             try:
                 # Decode the URL-encoded UTF-8
                 import urllib.parse
                 decoded = urllib.parse.unquote(hex_with_percent)
-                return decoded
+                # Only return decoded if it's a single character and printable
+                if len(decoded) == 1 and decoded.isprintable():
+                    return decoded
+                return hex_str
             except:
                 return hex_str
         
@@ -57,16 +76,29 @@ def fix_utf8_encoding(text: str) -> str:
         return text
 
 
-def fix_encoding_recursive(data: Any) -> Any:
+def fix_encoding_recursive(data: Any, log_samples: bool = False) -> Any:
     """
     Recursively fix UTF-8 encoding in all string values within nested structures.
+    
+    Args:
+        data: Data structure to fix
+        log_samples: If True, log sample values for debugging
     """
     if isinstance(data, str):
-        return fix_utf8_encoding(data)
+        # Log suspicious patterns for debugging
+        if log_samples and (('c' in data.lower() and any(c in data.lower() for c in ['2', '3'])) or '��' in data or '%' in data):
+            logger.info(f"[fix_encoding_recursive] Sample before: {data[:100]}")
+        
+        fixed = fix_utf8_encoding(data)
+        
+        if log_samples and fixed != data:
+            logger.info(f"[fix_encoding_recursive] Sample after: {fixed[:100]}")
+        
+        return fixed
     elif isinstance(data, list):
-        return [fix_encoding_recursive(item) for item in data]
+        return [fix_encoding_recursive(item, log_samples) for item in data]
     elif isinstance(data, dict):
-        return {key: fix_encoding_recursive(value) for key, value in data.items()}
+        return {key: fix_encoding_recursive(value, log_samples) for key, value in data.items()}
     else:
         return data
 
@@ -282,7 +314,8 @@ async def modify_sheet_values(
         logger.info(f"Successfully cleared range '{cleared_range}' for {user_google_email}.")
     else:
         # Fix incorrectly encoded UTF-8 characters (e.g., c3a9 → é)
-        values = fix_encoding_recursive(values)
+        if not DISABLE_UTF8_FIX:
+            values = fix_encoding_recursive(values, log_samples=True)
         
         # Chunking for large datasets to avoid timeouts and size limits
         CHUNK_SIZE = 5000  # rows per request
@@ -425,7 +458,8 @@ async def append_sheet_values(
         raise Exception("'values' must be provided and be a non-empty 2D array.")
 
     # Fix incorrectly encoded UTF-8 characters (e.g., c3a9 → é)
-    values = fix_encoding_recursive(values)
+    if not DISABLE_UTF8_FIX:
+        values = fix_encoding_recursive(values, log_samples=True)
 
     # Chunking for large datasets to avoid timeouts and size limits
     CHUNK_SIZE = 5000  # rows per request
@@ -562,7 +596,8 @@ async def append_rows_by_headers(
             raise Exception(f"Row {i} must be an object keyed by header names.")
 
     # Fix incorrectly encoded UTF-8 characters (e.g., c3a9 → é)
-    rows = fix_encoding_recursive(rows)
+    if not DISABLE_UTF8_FIX:
+        rows = fix_encoding_recursive(rows, log_samples=True)
 
     # 1) Read existing header row
     header_result = await asyncio.to_thread(
@@ -633,13 +668,17 @@ async def append_rows_by_headers(
     )
     existing_rows = len(col_a_values.get("values", [])) if col_a_values.get("values") else 0
     
-    # If we just wrote headers but the read didn't reflect them, account for the header row
-    if headers_were_written and existing_rows == 0:
+    # If we have headers (either just written or already existing), ensure we account for row 1
+    # This handles:
+    # 1. Race condition where just-written headers aren't reflected in the read
+    # 2. Existing headers where column A of row 1 is empty (header starts at column B+)
+    if all_headers and existing_rows == 0:
+        # Headers exist but column A appears empty - data should start at row 2
         existing_rows = 1
-        logger.info("[append_rows_by_headers] Adjusted existing_rows to 1 to account for just-written headers.")
+        logger.info("[append_rows_by_headers] Adjusted existing_rows to 1 to account for header row.")
     
     # If sheet has headers, existing_rows >= 1; next_row is existing_rows + 1
-    next_row = max(1, existing_rows + 1)
+    next_row = max(2, existing_rows + 1)  # Never write data to row 1 when we have headers
 
     CHUNK_SIZE = 5000  # rows per request to avoid large payload timeouts
     total_rows_appended = 0
