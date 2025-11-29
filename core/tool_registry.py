@@ -63,9 +63,13 @@ def global_exception_handler(func: Callable) -> Callable:
     async def wrapper(*args, **kwargs):
         tool_name = func.__name__
         try:
-            return await func(*args, **kwargs)
+            logger.debug(f"[GLOBAL EXCEPTION HANDLER] Executing tool: {tool_name}")
+            result = await func(*args, **kwargs)
+            logger.debug(f"[GLOBAL EXCEPTION HANDLER] Tool {tool_name} completed successfully")
+            return result
         except KeyboardInterrupt:
             # Don't catch keyboard interrupts - allow graceful shutdown
+            logger.info(f"[GLOBAL EXCEPTION HANDLER] KeyboardInterrupt in {tool_name}, re-raising")
             raise
         except Exception as e:
             # Log the full exception with traceback
@@ -73,17 +77,17 @@ def global_exception_handler(func: Callable) -> Callable:
             error_type = type(e).__name__
             
             logger.error(
-                f"[GLOBAL EXCEPTION HANDLER] Uncaught exception in tool '{tool_name}': {error_type}: {error_str}",
+                f"[GLOBAL EXCEPTION HANDLER] *** CAUGHT EXCEPTION *** Tool: {tool_name}, Type: {error_type}, Message: {error_str}",
                 exc_info=True
             )
             
-            # Log full traceback at debug level for troubleshooting
+            # Log full traceback for troubleshooting
             tb_str = traceback.format_exc()
-            logger.debug(f"Full traceback for {tool_name}:\n{tb_str}")
+            logger.error(f"[GLOBAL EXCEPTION HANDLER] Full traceback for {tool_name}:\n{tb_str}")
             
-            # If the error message already looks user-friendly (starts with ** or has newlines),
+            # If the error message already looks user-friendly (starts with ** or has specific prefixes),
             # just return it as-is
-            if error_str.startswith("**") or error_str.startswith("Error:") or error_str.startswith("API error"):
+            if error_str.startswith("**") or error_str.startswith("Error:") or error_str.startswith("API error") or error_str.startswith("❌"):
                 logger.info(f"[GLOBAL EXCEPTION HANDLER] Returning formatted error from {tool_name}")
                 return error_str
             
@@ -93,9 +97,10 @@ def global_exception_handler(func: Callable) -> Callable:
                 f"An error occurred while executing this tool:\n\n"
                 f"```\n{error_type}: {error_str}\n```\n\n"
                 f"This error has been logged for investigation. "
-                f"If this persists, please check the server logs for more details."
+                f"If this persists, please check the server logs at mcp_server_debug.log for more details."
             )
             
+            logger.info(f"[GLOBAL EXCEPTION HANDLER] Returning error message to client for {tool_name}")
             return error_msg
     
     return wrapper
@@ -106,9 +111,8 @@ def wrap_server_tool_method(server):
     Track tool registrations, add global exception handling, and filter them post-registration.
     This prevents uncaught exceptions from crashing the MCP server.
     
-    The global exception handler is applied as the OUTERMOST layer, ensuring that exceptions
-    from any decorator in the stack (including @require_google_service, @handle_http_errors, etc.)
-    are caught and don't crash the server.
+    The global exception handler wraps the function BEFORE registration, ensuring that when
+    FastMCP calls the tool, the exception handler is the outermost wrapper that catches everything.
     """
     original_tool = server.tool
     server._tracked_tools = []
@@ -119,14 +123,15 @@ def wrap_server_tool_method(server):
         def wrapper_decorator(func: Callable) -> Callable:
             tool_name = func.__name__
             server._tracked_tools.append(tool_name)
+            logger.debug(f"Registering tool with exception handler: {tool_name}")
             
-            # First, wrap the user's function with global exception handler
-            # This goes at the bottom of the decorator stack
+            # Wrap the function with global exception handler FIRST
+            # This ensures that when the tool is called, the exception handler is the outermost layer
             safe_func = global_exception_handler(func)
             
-            # Then apply the FastMCP decorator to register it
-            # Any additional decorators (@handle_http_errors, @require_google_service)
-            # are already applied to `func` before this point
+            # Then register the safe version with FastMCP
+            # The function `func` already has all other decorators applied to it
+            # (@handle_http_errors, @require_google_service, etc.)
             return original_decorator(safe_func)
         
         return wrapper_decorator
