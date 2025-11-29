@@ -602,7 +602,7 @@ async def share_drive_file(
         return "\n".join(output_parts)
         
     except Exception as e:
-        logger.error(f"Error sharing file: {e}")
+        logger.error(f"Error sharing file: {e}", exc_info=True)
         error_msg = str(e)
         
         # Provide helpful error messages for common issues
@@ -613,4 +613,5 @@ async def share_drive_file(
         elif "sharingRateLimitExceeded" in error_msg:
             return f"❌ Error: Sharing rate limit exceeded. Please try again later."
         else:
-            raise
+            # Return a generic error message instead of raising to prevent server crashes
+            return f"❌ Error: Failed to share file '{file_id}' with '{email}': {error_msg}"
