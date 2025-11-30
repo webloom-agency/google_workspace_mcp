@@ -820,7 +820,7 @@ async def create_spreadsheet(
         create_folders_if_missing (bool): When using folder_path, create folders that don't exist. Defaults to True.
 
     Returns:
-        str: Information about the newly created spreadsheet including ID and URL.
+        str: JSON string containing spreadsheet details (spreadsheet_id, spreadsheet_url, folder_id, title, message).
     """
     logger.info(f"[create_spreadsheet] Invoked. Email: '{user_google_email}', Title: {title}")
 
@@ -845,6 +845,7 @@ async def create_spreadsheet(
     # Handle folder placement
     folder_info = ""
     target_folder_id = folder_id
+    folder_name = None
     
     # Priority 1: folder_path (navigate through nested folders)
     if folder_path and not folder_id:
@@ -873,6 +874,7 @@ async def create_spreadsheet(
         )
         if folder:
             target_folder_id = folder['id']
+            folder_name = folder['name']
             search_scope = f" within folder {search_within_folder_id}" if search_within_folder_id else ""
             folder_info = f" | Folder: '{folder['name']}' ({folder['id']}){search_scope}"
         else:
@@ -890,13 +892,20 @@ async def create_spreadsheet(
         if move_success and not folder_info:
             folder_info = f" | Moved to folder: {target_folder_id}"
 
-    text_output = (
-        f"Successfully created spreadsheet '{title}' for {user_google_email}. "
-        f"ID: {spreadsheet_id} | URL: {spreadsheet_url}{folder_info}"
-    )
+    # Create human-readable message
+    message = f"Successfully created spreadsheet '{title}' for {user_google_email}.{folder_info}"
 
-    logger.info(f"Successfully created spreadsheet for {user_google_email}. ID: {spreadsheet_id}")
-    return text_output
+    # Create structured response
+    result = {
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_url": spreadsheet_url,
+        "folder_id": target_folder_id,
+        "title": title,
+        "message": message
+    }
+
+    logger.info(f"Successfully created spreadsheet for {user_google_email}. ID: {spreadsheet_id}, Folder ID: {target_folder_id}")
+    return json.dumps(result, indent=2)
 
 
 @server.tool()
