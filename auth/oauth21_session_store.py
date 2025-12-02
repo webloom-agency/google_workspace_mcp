@@ -237,13 +237,17 @@ class OAuth21SessionStore:
         Returns:
             Google Credentials object or None
         """
+        logger.debug(f"get_credentials called for {user_email}")
+        logger.debug(f"Acquiring lock in get_credentials...")
         with self._lock:
+            logger.debug(f"Lock acquired in get_credentials for {user_email}")
             session_info = self._sessions.get(user_email)
             if not session_info:
                 logger.debug(f"No OAuth 2.1 session found for {user_email}")
                 return None
             
             try:
+                logger.debug(f"Creating Credentials object for {user_email}...")
                 # Create Google credentials from session info
                 credentials = Credentials(
                     token=session_info["access_token"],
@@ -303,9 +307,14 @@ class OAuth21SessionStore:
         Returns:
             Google Credentials object if validation passes, None otherwise
         """
+        logger.debug(f"get_credentials_with_validation called for {requested_user_email}, session_id={session_id}, auth_token_email={auth_token_email}")
+        logger.debug(f"Acquiring lock...")
         with self._lock:
+            logger.debug(f"Lock acquired for {requested_user_email}")
             # Priority 1: Check auth token email (most secure, from verified JWT)
+            logger.debug(f"Checking auth_token_email: {auth_token_email}")
             if auth_token_email:
+                logger.debug(f"Auth token email provided: {auth_token_email}")
                 if auth_token_email != requested_user_email:
                     logger.error(
                         f"SECURITY VIOLATION: Token for {auth_token_email} attempted to access "
@@ -313,11 +322,17 @@ class OAuth21SessionStore:
                     )
                     return None
                 # Token email matches, allow access
-                return self.get_credentials(requested_user_email)
+                logger.debug(f"Auth token matches, getting credentials for {requested_user_email}")
+                result = self.get_credentials(requested_user_email)
+                logger.debug(f"Returning credentials: {result is not None}")
+                return result
             
             # Priority 2: Check session binding
+            logger.debug(f"Checking session_id: {session_id}")
             if session_id:
+                logger.debug(f"Session ID provided, checking binding...")
                 bound_user = self._session_auth_binding.get(session_id)
+                logger.debug(f"Bound user: {bound_user}")
                 if bound_user:
                     if bound_user != requested_user_email:
                         logger.error(
@@ -326,10 +341,15 @@ class OAuth21SessionStore:
                         )
                         return None
                     # Session binding matches, allow access
-                    return self.get_credentials(requested_user_email)
+                    logger.debug(f"Session binding matches, getting credentials")
+                    result = self.get_credentials(requested_user_email)
+                    logger.debug(f"Returning credentials: {result is not None}")
+                    return result
                 
                 # Check if this is an MCP session
+                logger.debug(f"Checking MCP session mapping...")
                 mcp_user = self._mcp_session_mapping.get(session_id)
+                logger.debug(f"MCP user: {mcp_user}")
                 if mcp_user:
                     if mcp_user != requested_user_email:
                         logger.error(
@@ -338,15 +358,23 @@ class OAuth21SessionStore:
                         )
                         return None
                     # MCP session matches, allow access
-                    return self.get_credentials(requested_user_email)
+                    logger.debug(f"MCP session matches, getting credentials")
+                    result = self.get_credentials(requested_user_email)
+                    logger.debug(f"Returning credentials: {result is not None}")
+                    return result
             
             # Special case: Allow access if user has recently authenticated (for clients that don't send tokens)
             # CRITICAL SECURITY: This is ONLY allowed in stdio mode, NEVER in OAuth 2.1 mode
+            logger.debug(f"Checking allow_recent_auth: {allow_recent_auth}")
             if allow_recent_auth and requested_user_email in self._sessions:
+                logger.debug(f"allow_recent_auth enabled and user in sessions, checking transport mode...")
                 # Check transport mode to ensure this is only used in stdio
                 try:
+                    logger.debug(f"Importing get_transport_mode (POTENTIAL DEADLOCK POINT)...")
                     from core.config import get_transport_mode
+                    logger.debug(f"Calling get_transport_mode()...")
                     transport_mode = get_transport_mode()
+                    logger.debug(f"Transport mode: {transport_mode}")
                     if transport_mode != "stdio":
                         logger.error(
                             f"SECURITY: Attempted to use allow_recent_auth in {transport_mode} mode. "
@@ -361,7 +389,9 @@ class OAuth21SessionStore:
                     f"Allowing credential access for {requested_user_email} based on recent authentication "
                     f"(stdio mode only - client not sending bearer token)"
                 )
-                return self.get_credentials(requested_user_email)
+                result = self.get_credentials(requested_user_email)
+                logger.debug(f"Returning credentials: {result is not None}")
+                return result
             
             # No session or token info available - deny access for security
             logger.warning(

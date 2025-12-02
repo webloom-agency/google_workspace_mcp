@@ -170,9 +170,10 @@ async def _authenticate_service(
     Returns:
         Tuple of (service, actual_user_email)
     """
+    logger.debug(f"[{tool_name}] _authenticate_service called with oauth21={use_oauth21}")
     if use_oauth21:
         logger.debug(f"[{tool_name}] Using OAuth 2.1 flow")
-        return await get_authenticated_google_service_oauth21(
+        result = await get_authenticated_google_service_oauth21(
             service_name=service_name,
             version=service_version,
             tool_name=tool_name,
@@ -182,9 +183,11 @@ async def _authenticate_service(
             auth_token_email=authenticated_user,
             allow_recent_auth=False,
         )
+        logger.debug(f"[{tool_name}] OAuth 2.1 authentication completed")
+        return result
     else:
         logger.debug(f"[{tool_name}] Using legacy OAuth 2.0 flow")
-        return await get_authenticated_google_service(
+        result = await get_authenticated_google_service(
             service_name=service_name,
             version=service_version,
             tool_name=tool_name,
@@ -192,6 +195,8 @@ async def _authenticate_service(
             required_scopes=resolved_scopes,
             session_id=mcp_session_id,
         )
+        logger.debug(f"[{tool_name}] OAuth 2.0 authentication completed")
+        return result
 
 
 async def get_authenticated_google_service_oauth21(
@@ -207,7 +212,10 @@ async def get_authenticated_google_service_oauth21(
     """
     OAuth 2.1 authentication using the session store with security validation.
     """
+    logger.debug(f"[{tool_name}] get_authenticated_google_service_oauth21 called for {user_google_email}")
+    logger.debug(f"[{tool_name}] Getting OAuth 2.1 session store...")
     store = get_oauth21_session_store()
+    logger.debug(f"[{tool_name}] Got session store, calling get_credentials_with_validation...")
 
     # Use the new validation method to ensure session can only access its own credentials
     credentials = store.get_credentials_with_validation(
@@ -216,6 +224,7 @@ async def get_authenticated_google_service_oauth21(
         auth_token_email=auth_token_email,
         allow_recent_auth=allow_recent_auth,
     )
+    logger.debug(f"[{tool_name}] get_credentials_with_validation returned: {credentials is not None}")
 
     if not credentials:
         raise GoogleAuthenticationError(
@@ -223,12 +232,14 @@ async def get_authenticated_google_service_oauth21(
             f"You can only access credentials for your authenticated account."
         )
 
+    logger.debug(f"[{tool_name}] Checking scopes...")
     # Check scopes
     if not all(scope in credentials.scopes for scope in required_scopes):
         raise GoogleAuthenticationError(
             f"OAuth 2.1 credentials lack required scopes. Need: {required_scopes}, Have: {credentials.scopes}"
         )
 
+    logger.debug(f"[{tool_name}] Building Google API service...")
     # Build service
     service = build(service_name, version, credentials=credentials)
     logger.info(f"[{tool_name}] Authenticated {service_name} for {user_google_email}")
@@ -431,11 +442,14 @@ def require_google_service(
         async def wrapper(*args, **kwargs):
             # Note: `args` and `kwargs` are now the arguments for the *wrapper*,
             # which does not include 'service'.
+            tool_name = func.__name__
+            logger.debug(f"[{tool_name}] Decorator wrapper called")
 
             # Extract user_google_email from the arguments passed to the wrapper
             bound_args = wrapper_sig.bind(*args, **kwargs)
             bound_args.apply_defaults()
             user_google_email = bound_args.arguments.get("user_google_email")
+            logger.debug(f"[{tool_name}] Extracted user_google_email: {user_google_email}")
 
             if not user_google_email:
                 # This should ideally not be reached if 'user_google_email' is a required parameter
@@ -450,17 +464,19 @@ def require_google_service(
             config = SERVICE_CONFIGS[service_type]
             service_name = config["service"]
             service_version = version or config["version"]
+            logger.debug(f"[{tool_name}] Service config: {service_name} v{service_version}")
 
             # Resolve scopes
             resolved_scopes = _resolve_scopes(scopes)
+            logger.debug(f"[{tool_name}] Resolved scopes: {len(resolved_scopes)} scopes")
 
             try:
-                tool_name = func.__name__
-
                 # Get authentication context
+                logger.debug(f"[{tool_name}] Getting auth context...")
                 authenticated_user, auth_method, mcp_session_id = _get_auth_context(
                     tool_name
                 )
+                logger.debug(f"[{tool_name}] Got auth context: user={authenticated_user}, method={auth_method}")
 
                 # Log authentication status
                 logger.debug(
@@ -468,11 +484,14 @@ def require_google_service(
                 )
 
                 # Detect OAuth version
+                logger.debug(f"[{tool_name}] Detecting OAuth version...")
                 use_oauth21 = _detect_oauth_version(
                     authenticated_user, mcp_session_id, tool_name
                 )
+                logger.debug(f"[{tool_name}] OAuth version detected: {'2.1' if use_oauth21 else '2.0'}")
 
                 # Override user_google_email with authenticated user when using OAuth 2.1
+                logger.debug(f"[{tool_name}] Checking email override...")
                 wrapper_params = list(wrapper_sig.parameters.keys())
                 user_google_email, args = _override_oauth21_user_email(
                     use_oauth21,
@@ -483,12 +502,14 @@ def require_google_service(
                     wrapper_params,
                     tool_name,
                 )
+                logger.debug(f"[{tool_name}] Final user_google_email: {user_google_email}")
 
                 # Update bound_args for consistency
                 if use_oauth21 and authenticated_user and user_google_email == authenticated_user:
                     bound_args.arguments["user_google_email"] = authenticated_user
 
                 # Authenticate service
+                logger.debug(f"[{tool_name}] Authenticating service...")
                 service, actual_user_email = await _authenticate_service(
                     use_oauth21,
                     service_name,
@@ -499,6 +520,7 @@ def require_google_service(
                     mcp_session_id,
                     authenticated_user,
                 )
+                logger.debug(f"[{tool_name}] Service authenticated successfully")
             except GoogleAuthenticationError as e:
                 logger.error(
                     f"[{tool_name}] GoogleAuthenticationError during authentication. "
