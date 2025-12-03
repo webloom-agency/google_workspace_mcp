@@ -671,17 +671,18 @@ async def append_rows_by_headers(
     # Handle case where rows is wrapped in an object (e.g., {"result": [...]})
     if isinstance(rows, dict):
         logger.info(f"[append_rows_by_headers] Received dict with keys: {list(rows.keys())}")
-        # Check if there's a 'result' or 'data' key containing the actual array
-        if 'result' in rows and isinstance(rows['result'], list):
-            logger.info(f"[append_rows_by_headers] Extracting array from 'result' key ({len(rows['result'])} items)")
-            rows = rows['result']
-        elif 'data' in rows and isinstance(rows['data'], list):
-            logger.info(f"[append_rows_by_headers] Extracting array from 'data' key ({len(rows['data'])} items)")
-            rows = rows['data']
-        elif 'rows' in rows and isinstance(rows['rows'], list):
-            logger.info(f"[append_rows_by_headers] Extracting array from 'rows' key ({len(rows['rows'])} items)")
-            rows = rows['rows']
-        else:
+        
+        # Try to extract from common wrapper keys
+        extracted = False
+        for key in ['result', 'data', 'rows']:
+            if key in rows:
+                logger.info(f"[append_rows_by_headers] Found '{key}' key in wrapper object")
+                rows = rows[key]
+                extracted = True
+                break
+        
+        # After extraction, check if we still have a dict (might be object with numeric keys)
+        if isinstance(rows, dict):
             # Check if it's a dict with numeric string keys (like {"0": {...}, "1": {...}})
             keys = list(rows.keys())
             if keys and all(k.isdigit() for k in keys):
@@ -689,10 +690,11 @@ async def append_rows_by_headers(
                 # Sort by numeric value and convert to list
                 sorted_items = sorted(rows.items(), key=lambda x: int(x[0]))
                 rows = [item[1] for item in sorted_items]
-            else:
+            elif not extracted:
+                # We didn't extract anything and it's not numeric keys
                 raise Exception(
-                    f"'rows' is a dict but doesn't contain 'result', 'data', or 'rows' key with an array. "
-                    f"Keys found: {keys}. Please provide rows as a list of objects."
+                    f"'rows' is a dict but doesn't contain 'result', 'data', or 'rows' key with an array, "
+                    f"and doesn't have numeric keys. Keys found: {keys}. Please provide rows as a list of objects."
                 )
 
     if not rows or not isinstance(rows, list):
