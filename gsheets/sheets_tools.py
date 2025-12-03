@@ -210,6 +210,7 @@ async def read_sheet_values(
     user_google_email: str,
     spreadsheet_id: str,
     range_name: str = "A1:Z1000",
+    max_display_rows: int = 50,
 ) -> str:
     """
     Reads values from a specific range in a Google Sheet.
@@ -218,11 +219,12 @@ async def read_sheet_values(
         user_google_email (str): The user's Google email address. Required.
         spreadsheet_id (str): The ID of the spreadsheet. Required.
         range_name (str): The range to read (e.g., "Sheet1!A1:D10", "A1:D10"). Defaults to "A1:Z1000".
+        max_display_rows (int): Maximum number of rows to display in output. Set to -1 for unlimited. Defaults to 50.
 
     Returns:
         str: The formatted values from the specified range.
     """
-    logger.info(f"[read_sheet_values] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Range: {range_name}")
+    logger.info(f"[read_sheet_values] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Range: {range_name}, MaxDisplay: {max_display_rows}")
 
     result = await asyncio.to_thread(
         service.spreadsheets()
@@ -242,10 +244,14 @@ async def read_sheet_values(
         padded_row = row + [""] * max(0, len(values[0]) - len(row)) if values else row
         formatted_rows.append(f"Row {i:2d}: {padded_row}")
 
+    # Determine how many rows to show
+    display_limit = len(formatted_rows) if max_display_rows == -1 else max_display_rows
+    show_all = max_display_rows == -1 or len(formatted_rows) <= max_display_rows
+    
     text_output = (
         f"Successfully read {len(values)} rows from range '{range_name}' in spreadsheet {spreadsheet_id} for {user_google_email}:\n"
-        + "\n".join(formatted_rows[:50])  # Limit to first 50 rows for readability
-        + (f"\n... and {len(values) - 50} more rows" if len(values) > 50 else "")
+        + "\n".join(formatted_rows[:display_limit])
+        + ("" if show_all else f"\n... and {len(values) - display_limit} more rows")
     )
 
     logger.info(f"Successfully read {len(values)} rows for {user_google_email}.")
