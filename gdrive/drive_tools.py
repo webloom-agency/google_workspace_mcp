@@ -5,8 +5,9 @@ This module provides MCP tools for interacting with Google Drive API.
 """
 import logging
 import asyncio
+import json
 import re
-from typing import Optional
+from typing import Optional, List
 
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 import io
@@ -615,3 +616,97 @@ async def share_drive_file(
         else:
             # Return a generic error message instead of raising to prevent server crashes
             return f"❌ Error: Failed to share file '{file_id}' with '{email}': {error_msg}"
+
+
+@server.tool()
+@handle_http_errors("create_drive_folder", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def create_drive_folder(
+    service,
+    user_google_email: str,
+    folder_name: Optional[str] = None,
+    parent_folder_id: Optional[str] = None,
+    folder_path: Optional[List[str]] = None,
+    root_folder_id: Optional[str] = None,
+    create_folders_if_missing: bool = True,
+) -> str:
+    """
+    Creates a new folder in Google Drive, with support for recursive folder creation.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        folder_name (Optional[str]): Name of a single folder to create. Use this for simple folder creation.
+        parent_folder_id (Optional[str]): Parent folder ID when using folder_name. If not specified, creates in My Drive root.
+        folder_path (Optional[List[str]]): Navigate through nested folders by name patterns (e.g., ["CLIENTS", "xxx.fr", "SEO"]). 
+                                           Searches for each folder in order, creating missing ones if create_folders_if_missing is True.
+        root_folder_id (Optional[str]): When using folder_path, start navigation from this folder ID. If not specified, starts from My Drive root.
+        create_folders_if_missing (bool): When using folder_path, create folders that don't exist. Defaults to True.
+
+    Returns:
+        str: JSON string containing folder details (folder_id, folder_name, folder_url, path_summary, message).
+    
+    Examples:
+        Simple folder creation:
+        - folder_name="My Folder", parent_folder_id="abc123"
+        
+        Recursive folder path creation:
+        - folder_path=["CLIENTS", "company.com", "SEO"], create_folders_if_missing=True
+    """
+    logger.info(f"[create_drive_folder] Invoked. Email: '{user_google_email}', folder_name: {folder_name}, folder_path: {folder_path}")
+
+    # Validate input
+    if not folder_name and not folder_path:
+        raise Exception("You must provide either 'folder_name' or 'folder_path'.")
+    
+    if folder_name and folder_path:
+        raise Exception("Provide either 'folder_name' or 'folder_path', not both.")
+
+    folder_result = None
+    path_summary = None
+
+    # Option 1: Simple single folder creation
+    if folder_name:
+        from gdrive.drive_helpers import create_folder
+        
+        folder_result = await create_folder(
+            service,
+            folder_name,
+            parent_folder_id=parent_folder_id
+        )
+        
+        if not folder_result:
+            raise Exception(f"Failed to create folder '{folder_name}'.")
+        
+        parent_info = f" in folder {parent_folder_id}" if parent_folder_id else " in My Drive root"
+        message = f"Successfully created folder '{folder_result['name']}'{parent_info}."
+        path_summary = folder_result['name']
+
+    # Option 2: Recursive folder path creation
+    elif folder_path:
+        from gdrive.drive_helpers import find_or_create_folder_path
+        
+        folder_result = await find_or_create_folder_path(
+            service,
+            folder_path,
+            root_folder_id=root_folder_id,
+            create_missing=create_folders_if_missing
+        )
+        
+        if not folder_result:
+            raise Exception(f"Failed to navigate/create folder path: {' > '.join(folder_path)}")
+        
+        path_summary = folder_result.get('path_summary', ' > '.join(folder_path))
+        root_info = f" from folder {root_folder_id}" if root_folder_id else " from My Drive root"
+        message = f"Successfully navigated/created folder path{root_info}. Path: {path_summary}"
+
+    # Create structured response
+    result = {
+        "folder_id": folder_result['id'],
+        "folder_name": folder_result['name'],
+        "folder_url": folder_result.get('webViewLink', ''),
+        "path_summary": path_summary,
+        "message": message
+    }
+
+    logger.info(f"Successfully created/found folder for {user_google_email}. ID: {folder_result['id']}, Path: {path_summary}")
+    return json.dumps(result, indent=2)
