@@ -307,7 +307,7 @@ async def find_or_create_folder_path(
     
     Args:
         service: Google Drive service instance
-        folder_path: List of folder name patterns to navigate through (in order)
+        folder_path: List of folder names to navigate through (in order). Uses exact name matching.
         root_folder_id: Optional starting folder ID. If None, starts from My Drive root.
         create_missing: If True, creates folders that don't exist. If False, returns None if path doesn't exist.
         
@@ -323,15 +323,17 @@ async def find_or_create_folder_path(
     
     logger.info(f"[find_or_create_folder_path] Navigating path: {' > '.join(folder_path)} (create_missing={create_missing})")
     
-    current_parent_id = root_folder_id
+    # Use 'root' as the starting parent if no root_folder_id is provided
+    # This ensures the first folder is searched in My Drive root, not anywhere in Drive
+    current_parent_id = root_folder_id if root_folder_id else 'root'
     path_summary = []
     
-    for i, folder_name_pattern in enumerate(folder_path):
-        # Try to find existing folder
+    for i, folder_name in enumerate(folder_path):
+        # Try to find existing folder with exact name match
         folder = await find_folder_by_name_pattern(
             service,
-            folder_name_pattern,
-            exact_match=False,
+            folder_name,
+            exact_match=True,  # Use exact match for folder path navigation
             parent_folder_id=current_parent_id
         )
         
@@ -340,16 +342,16 @@ async def find_or_create_folder_path(
             path_summary.append(f"{folder['name']}")
             current_parent_id = folder['id']
         elif create_missing:
-            # Create the folder
-            logger.info(f"[find_or_create_folder_path] Folder '{folder_name_pattern}' not found, creating it...")
+            # Create the folder with the exact name specified
+            logger.info(f"[find_or_create_folder_path] Folder '{folder_name}' not found, creating it...")
             new_folder = await create_folder(
                 service,
-                folder_name_pattern,
-                parent_folder_id=current_parent_id
+                folder_name,
+                parent_folder_id=current_parent_id if current_parent_id != 'root' else None
             )
             
             if not new_folder:
-                logger.error(f"[find_or_create_folder_path] Failed to create folder '{folder_name_pattern}'")
+                logger.error(f"[find_or_create_folder_path] Failed to create folder '{folder_name}'")
                 return None
             
             logger.info(f"[find_or_create_folder_path] Created folder: '{new_folder['name']}' (ID: {new_folder['id']})")
@@ -357,7 +359,7 @@ async def find_or_create_folder_path(
             current_parent_id = new_folder['id']
             folder = new_folder
         else:
-            logger.warning(f"[find_or_create_folder_path] Folder '{folder_name_pattern}' not found and create_missing=False")
+            logger.warning(f"[find_or_create_folder_path] Folder '{folder_name}' not found and create_missing=False")
             return None
     
     # Return the final folder in the path
