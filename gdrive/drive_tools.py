@@ -710,3 +710,133 @@ async def create_drive_folder(
 
     logger.info(f"Successfully created/found folder for {user_google_email}. ID: {folder_result['id']}, Path: {path_summary}")
     return json.dumps(result, indent=2)
+
+
+@server.tool()
+@handle_http_errors("copy_drive_file", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def copy_drive_file(
+    service,
+    user_google_email: str,
+    source_file_id: str,
+    new_name: Optional[str] = None,
+    folder_id: Optional[str] = None,
+    folder_name_contains: Optional[str] = None,
+    search_within_folder_id: Optional[str] = None,
+    folder_path: Optional[List[str]] = None,
+    create_folders_if_missing: bool = True,
+) -> str:
+    """
+    Copies an existing Google Drive file (spreadsheet, doc, slide, or any file) to a new location.
+    Ideal for creating files from templates.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        source_file_id (str): The ID of the file to copy (template). Required.
+        new_name (Optional[str]): The name for the copied file. If not provided, uses "Copy of [original name]".
+        folder_id (Optional[str]): Specific folder ID to place the copy in.
+        folder_name_contains (Optional[str]): Search for folder name containing this string. Uses the most recently modified match.
+        search_within_folder_id (Optional[str]): When using folder_name_contains, limit search to within this parent folder.
+        folder_path (Optional[List[str]]): Navigate through nested folders by exact name (e.g., ["CLIENTS", "xxx.fr", "SEO"]). 
+                                           Creates missing folders if create_folders_if_missing is True.
+        create_folders_if_missing (bool): When using folder_path, create folders that don't exist. Defaults to True.
+
+    Returns:
+        str: Details about the copied file including ID, URL, and folder location.
+    
+    Examples:
+        Copy a template spreadsheet to a specific folder path:
+        - source_file_id="abc123", new_name="Q1 Report", folder_path=["CLIENTS", "acme.com", "Reports"]
+        
+        Copy a template to a folder matching a pattern:
+        - source_file_id="abc123", new_name="New Document", folder_name_contains="Projects"
+    """
+    logger.info(f"[copy_drive_file] Invoked. Email: '{user_google_email}', Source: {source_file_id}")
+
+    # Get source file metadata
+    source_file = await asyncio.to_thread(
+        service.files().get(
+            fileId=source_file_id,
+            fields="id, name, mimeType, webViewLink",
+            supportsAllDrives=True
+        ).execute
+    )
+    
+    source_name = source_file.get("name", "Unknown")
+    source_type = source_file.get("mimeType", "Unknown")
+    
+    # Determine the copy name
+    copy_name = new_name if new_name else f"Copy of {source_name}"
+    
+    # Handle folder placement
+    folder_info = ""
+    target_folder_id = folder_id
+    
+    # Priority 1: folder_path (navigate through nested folders)
+    if folder_path and not folder_id:
+        from gdrive.drive_helpers import find_or_create_folder_path
+        folder_result = await find_or_create_folder_path(
+            service,
+            folder_path,
+            root_folder_id=search_within_folder_id,
+            create_missing=create_folders_if_missing
+        )
+        if folder_result:
+            target_folder_id = folder_result['id']
+            folder_info = f"\n- Path: {folder_result['path_summary']}"
+        else:
+            folder_info = f"\n- Warning: Could not navigate folder path {' > '.join(folder_path)}, copied to My Drive"
+    
+    # Priority 2: folder_name_contains (simple search)
+    elif folder_name_contains and not folder_id:
+        from gdrive.drive_helpers import find_folder_by_name_pattern
+        folder = await find_folder_by_name_pattern(
+            service,
+            folder_name_contains,
+            exact_match=False,
+            user_email=user_google_email,
+            parent_folder_id=search_within_folder_id
+        )
+        if folder:
+            target_folder_id = folder['id']
+            search_scope = f" within folder {search_within_folder_id}" if search_within_folder_id else ""
+            folder_info = f"\n- Folder: '{folder['name']}' ({folder['id']}){search_scope}"
+        else:
+            search_scope = f" within folder {search_within_folder_id}" if search_within_folder_id else " in all Drive"
+            folder_info = f"\n- Warning: No folder found matching '{folder_name_contains}'{search_scope}, copied to My Drive"
+    
+    # Build the copy request body
+    copy_body = {
+        'name': copy_name
+    }
+    
+    if target_folder_id:
+        copy_body['parents'] = [target_folder_id]
+        if not folder_info:
+            folder_info = f"\n- Moved to folder: {target_folder_id}"
+    
+    # Execute the copy
+    copied_file = await asyncio.to_thread(
+        service.files().copy(
+            fileId=source_file_id,
+            body=copy_body,
+            fields="id, name, mimeType, webViewLink, parents",
+            supportsAllDrives=True
+        ).execute
+    )
+    
+    copy_id = copied_file.get('id')
+    copy_url = copied_file.get('webViewLink', f"https://drive.google.com/file/d/{copy_id}/view")
+    
+    # Determine the file type for display
+    file_type_display = source_type.split('.')[-1] if 'google-apps' in source_type else source_type
+    
+    confirmation_message = f"""File Copied Successfully for {user_google_email}:
+- Source: {source_name} (ID: {source_file_id})
+- Source Type: {file_type_display}
+- New File: {copy_name}
+- New ID: {copy_id}
+- URL: {copy_url}{folder_info}"""
+
+    logger.info(f"File copied successfully for {user_google_email}. New ID: {copy_id}")
+    return confirmation_message
