@@ -103,6 +103,104 @@ def fix_encoding_recursive(data: Any, log_samples: bool = False) -> Any:
         return data
 
 
+def _remove_trailing_commas(json_str: str) -> str:
+    """
+    Remove trailing commas from JSON string while respecting string boundaries.
+    E.g., [1, 2, 3,] → [1, 2, 3] and {"a": 1,} → {"a": 1}
+    """
+    result = []
+    in_string = False
+    escape_next = False
+
+    for i, char in enumerate(json_str):
+        if escape_next:
+            result.append(char)
+            escape_next = False
+            continue
+
+        if char == '\\' and in_string:
+            result.append(char)
+            escape_next = True
+            continue
+
+        if char == '"':
+            in_string = not in_string
+            result.append(char)
+            continue
+
+        if not in_string and char == ',':
+            # Look ahead past whitespace for a closing bracket/brace
+            rest = json_str[i + 1:].lstrip()
+            if rest and rest[0] in (']', '}'):
+                continue  # Skip this trailing comma
+
+        result.append(char)
+
+    return ''.join(result)
+
+
+def _repair_json_string(json_str: str, context: str = "") -> Any:
+    """
+    Parse JSON with automatic repair of common LLM output errors.
+
+    Handles:
+    - Trailing commas before ] or }
+    - Missing commas between elements (iterative insertion at error positions)
+
+    Args:
+        json_str: The JSON string to parse and possibly repair.
+        context: Label for log messages (e.g. function name).
+
+    Returns:
+        Parsed Python object.
+
+    Raises:
+        json.JSONDecodeError: If JSON cannot be repaired after all attempts.
+    """
+    # 1. Try parsing as-is
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as first_error:
+        logger.warning(
+            f"[{context}] Initial JSON parse failed at pos {first_error.pos}: "
+            f"{first_error.msg}. Attempting repair..."
+        )
+
+    # 2. Remove trailing commas and retry
+    cleaned = _remove_trailing_commas(json_str)
+    try:
+        result = json.loads(cleaned)
+        logger.info(f"[{context}] JSON repaired by removing trailing commas")
+        return result
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Iteratively insert missing commas at positions reported by the parser
+    current = cleaned
+    max_attempts = 50  # Safety limit for very large payloads
+    insertions = 0
+
+    for _ in range(max_attempts):
+        try:
+            result = json.loads(current)
+            logger.info(f"[{context}] JSON repaired after {insertions} comma insertion(s)")
+            return result
+        except json.JSONDecodeError as e:
+            if "Expecting ',' delimiter" in str(e):
+                current = current[:e.pos] + ',' + current[e.pos:]
+                insertions += 1
+            else:
+                # Different error — stop trying comma insertions
+                break
+
+    # 4. All repair strategies exhausted — raise the original error
+    logger.error(
+        f"[{context}] JSON repair failed after removing trailing commas and "
+        f"{insertions} comma insertion(s). Original error: {first_error}"
+    )
+    raise first_error
+
+
 @server.tool()
 @handle_http_errors("list_spreadsheets", is_read_only=True, service_type="sheets")
 @require_google_service("drive", "drive_read")
@@ -290,7 +388,7 @@ async def modify_sheet_values(
     # Parse values if it's a JSON string (MCP passes parameters as JSON strings)
     if values is not None and isinstance(values, str):
         try:
-            parsed_values = json.loads(values)
+            parsed_values = _repair_json_string(values, context="modify_sheet_values")
             if not isinstance(parsed_values, list):
                 raise ValueError(f"Values must be a list, got {type(parsed_values).__name__}")
             # Validate it's a list of lists
@@ -483,7 +581,7 @@ async def append_sheet_values(
     # Parse values if it's a JSON string (MCP passes parameters as JSON strings)
     if values is not None and isinstance(values, str):
         try:
-            parsed_values = json.loads(values)
+            parsed_values = _repair_json_string(values, context="append_sheet_values")
             if not isinstance(parsed_values, list):
                 raise ValueError(f"Values must be a list, got {type(parsed_values).__name__}")
             for i, row in enumerate(parsed_values):
@@ -657,10 +755,10 @@ async def append_rows_by_headers(
         f"[append_rows_by_headers] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Sheet: {sheet_name}"
     )
 
-    # Parse rows if provided as JSON string
+    # Parse rows if provided as JSON string (with automatic repair of common LLM errors)
     if rows is not None and isinstance(rows, str):
         try:
-            parsed_rows = json.loads(rows)
+            parsed_rows = _repair_json_string(rows, context="append_rows_by_headers")
             rows = parsed_rows
             logger.info(
                 f"[append_rows_by_headers] Parsed JSON string to Python list with {len(rows) if isinstance(rows, list) else 0} items"
