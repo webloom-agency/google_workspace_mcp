@@ -766,34 +766,50 @@ async def append_rows_by_headers(
         except json.JSONDecodeError as e:
             raise Exception(f"Invalid JSON format for rows: {e}")
 
-    # Handle case where rows is wrapped in an object (e.g., {"result": [...]})
-    if isinstance(rows, dict):
-        logger.info(f"[append_rows_by_headers] Received dict with keys: {list(rows.keys())}")
-        
-        # Try to extract from common wrapper keys
+    # Handle case where rows is wrapped in an object (e.g., {"result": [...]}, {"answer": [...]})
+    # Loop to handle multi-level nesting (e.g., {"answer": {"answer": [...]}})
+    KNOWN_WRAPPER_KEYS = ['result', 'data', 'rows', 'answer', 'items', 'values', 'output', 'response']
+    MAX_UNWRAP_DEPTH = 5  # safety limit against infinite loops
+    unwrap_depth = 0
+
+    while isinstance(rows, dict) and unwrap_depth < MAX_UNWRAP_DEPTH:
+        unwrap_depth += 1
+        logger.info(f"[append_rows_by_headers] Unwrap depth {unwrap_depth}: dict with keys: {list(rows.keys())}")
+
+        # Try to extract from known wrapper keys
         extracted = False
-        for key in ['result', 'data', 'rows']:
+        for key in KNOWN_WRAPPER_KEYS:
             if key in rows:
-                logger.info(f"[append_rows_by_headers] Found '{key}' key in wrapper object")
+                logger.info(f"[append_rows_by_headers] Found '{key}' key in wrapper object, extracting...")
                 rows = rows[key]
                 extracted = True
                 break
-        
-        # After extraction, check if we still have a dict (might be object with numeric keys)
-        if isinstance(rows, dict):
-            # Check if it's a dict with numeric string keys (like {"0": {...}, "1": {...}})
-            keys = list(rows.keys())
-            if keys and all(k.isdigit() for k in keys):
-                logger.info(f"[append_rows_by_headers] Detected object with numeric keys, converting to list ({len(keys)} items)")
-                # Sort by numeric value and convert to list
-                sorted_items = sorted(rows.items(), key=lambda x: int(x[0]))
-                rows = [item[1] for item in sorted_items]
-            elif not extracted:
-                # We didn't extract anything and it's not numeric keys
-                raise Exception(
-                    f"'rows' is a dict but doesn't contain 'result', 'data', or 'rows' key with an array, "
-                    f"and doesn't have numeric keys. Keys found: {keys}. Please provide rows as a list of objects."
-                )
+
+        if extracted:
+            # Continue loop — the extracted value might itself be another dict wrapper
+            continue
+
+        # Not a known wrapper key — check if it's a dict with numeric string keys ({"0": {...}, "1": {...}})
+        keys = list(rows.keys())
+        if keys and all(k.isdigit() for k in keys):
+            logger.info(f"[append_rows_by_headers] Detected object with numeric keys, converting to list ({len(keys)} items)")
+            sorted_items = sorted(rows.items(), key=lambda x: int(x[0]))
+            rows = [item[1] for item in sorted_items]
+            break  # now it's a list, exit the loop
+
+        # Unknown dict structure — try single-key unwrap as last resort
+        if len(keys) == 1:
+            single_key = keys[0]
+            logger.info(f"[append_rows_by_headers] Single unknown key '{single_key}', unwrapping...")
+            rows = rows[single_key]
+            continue
+
+        # Multiple unknown keys — cannot determine which holds the rows
+        raise Exception(
+            f"'rows' is a dict with unrecognized keys: {keys}. "
+            f"Known wrapper keys: {KNOWN_WRAPPER_KEYS}. "
+            f"Please provide rows as a list of objects, or wrap in one of the known keys."
+        )
 
     if not rows or not isinstance(rows, list):
         raise Exception("'rows' must be a non-empty list of objects keyed by headers.")
