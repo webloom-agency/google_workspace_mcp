@@ -277,6 +277,27 @@ def handle_http_errors(tool_name: str, is_read_only: bool = False, service_type:
                             "This is likely a temporary network or certificate issue. Please try again shortly."
                         ) from e
                 except HttpError as error:
+                    # Retry on transient server errors (500, 502, 503) with exponential backoff
+                    # Google recommends retrying these: https://cloud.google.com/apis/design/errors#retrying_errors
+                    if error.resp.status in (500, 502, 503) and attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(
+                            f"[{tool_name}] Transient HTTP {error.resp.status} on attempt {attempt + 1}/{max_retries}: "
+                            f"{error}. Retrying in {delay}s..."
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    # Retry on rate limit (429) with longer backoff
+                    if error.resp.status == 429 and attempt < max_retries - 1:
+                        delay = base_delay * (2 ** (attempt + 1))  # longer backoff for rate limits
+                        logger.warning(
+                            f"[{tool_name}] Rate limited (429) on attempt {attempt + 1}/{max_retries}: "
+                            f"{error}. Retrying in {delay}s..."
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
                     user_google_email = kwargs.get("user_google_email", "N/A")
                     error_details = str(error)
                     
@@ -302,11 +323,25 @@ def handle_http_errors(tool_name: str, is_read_only: bool = False, service_type:
                             f"You might need to re-authenticate for user '{user_google_email}'. "
                             f"LLM: Try 'start_google_auth' with the user's email and the appropriate service_name."
                         )
+                    elif error.resp.status in (500, 502, 503):
+                        # Transient error on final attempt
+                        message = (
+                            f"API error in {tool_name}: {error}. "
+                            f"Google returned a transient server error (HTTP {error.resp.status}) after {max_retries} attempts. "
+                            f"Please try again shortly."
+                        )
+                    elif error.resp.status == 429:
+                        # Rate limit on final attempt
+                        message = (
+                            f"API error in {tool_name}: {error}. "
+                            f"Google rate-limited the request (HTTP 429) after {max_retries} attempts. "
+                            f"Please wait a moment and try again."
+                        )
                     else:
                         # Other HTTP errors (400 Bad Request, etc.) - don't suggest re-auth
                         message = f"API error in {tool_name}: {error}"
                     
-                    logger.error(f"API error in {tool_name}: {error}", exc_info=True)
+                    logger.error(f"[UTILS] API error in {tool_name}: {error}", exc_info=True)
                     raise Exception(message) from error
                 except TransientNetworkError:
                     # Re-raise without wrapping to preserve the specific error type

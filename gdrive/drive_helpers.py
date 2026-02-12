@@ -321,6 +321,18 @@ async def find_or_create_folder_path(
         logger.warning("[find_or_create_folder_path] Empty folder path provided")
         return None
     
+    # Replace empty/whitespace-only folder names with "Untitled" to avoid creating unnamed folders
+    sanitized_path = []
+    for i, name in enumerate(folder_path):
+        if not name or not name.strip():
+            logger.warning(
+                f"[find_or_create_folder_path] Empty folder name at position {i + 1}, defaulting to 'Untitled'"
+            )
+            sanitized_path.append("Untitled")
+        else:
+            sanitized_path.append(name.strip())
+    folder_path = sanitized_path
+    
     logger.info(f"[find_or_create_folder_path] Navigating path: {' > '.join(folder_path)} (create_missing={create_missing})")
     
     # Use 'root' as the starting parent if no root_folder_id is provided
