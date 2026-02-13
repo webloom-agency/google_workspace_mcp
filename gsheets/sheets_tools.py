@@ -878,10 +878,31 @@ async def append_rows_by_headers(
             "No headers exist and write_headers_if_missing is False; cannot map rows."
         )
 
-    # 4) Map input objects to row lists aligned with all_headers
+    # 4) Map input objects to row lists aligned with all_headers,
+    #    flattening any nested lists/dicts to sheet-safe primitives
+    def _flatten_cell(value, row_idx: int, col_idx: int):
+        """Convert nested lists/dicts to strings; keep primitives as-is."""
+        if isinstance(value, (list, tuple)):
+            flat_parts = []
+            for v in value:
+                if isinstance(v, (list, tuple)):
+                    flat_parts.append(", ".join(str(x) if x is not None else "" for x in v))
+                elif isinstance(v, dict):
+                    flat_parts.append(json.dumps(v))
+                else:
+                    flat_parts.append(str(v) if v is not None else "")
+            result = ", ".join(flat_parts)
+            logger.debug(
+                f"[append_rows_by_headers] Flattened list at row {row_idx}, col {col_idx}: {value!r:.80} -> {result!r:.80}"
+            )
+            return result
+        elif isinstance(value, dict):
+            return json.dumps(value)
+        return value
+
     values_to_append: List[List[Any]] = []
-    for item in rows:
-        mapped_row = [item.get(h, "") for h in all_headers]
+    for i, item in enumerate(rows):
+        mapped_row = [_flatten_cell(item.get(h, ""), i, j) for j, h in enumerate(all_headers)]
         values_to_append.append(mapped_row)
 
     # 5) Append rows at the end of the sheet
