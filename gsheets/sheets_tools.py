@@ -906,6 +906,67 @@ async def append_rows_by_headers(
     # If sheet has headers, existing_rows >= 1; next_row is existing_rows + 1
     next_row = max(2, existing_rows + 1)  # Never write data to row 1 when we have headers
 
+    # 6) Auto-expand the sheet grid if needed (.update() cannot write beyond grid limits)
+    required_rows = next_row + len(values_to_append) - 1  # last row we'll write to
+    required_cols = len(all_headers)
+
+    # Get the sheet's current grid dimensions and sheetId
+    spreadsheet_meta = await asyncio.to_thread(
+        service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute
+    )
+    target_sheet = None
+    for s in spreadsheet_meta.get("sheets", []):
+        if s.get("properties", {}).get("title") == sheet_name:
+            target_sheet = s
+            break
+    
+    if target_sheet:
+        grid_props = target_sheet.get("properties", {}).get("gridProperties", {})
+        current_max_rows = grid_props.get("rowCount", 1000)
+        current_max_cols = grid_props.get("columnCount", 26)
+        target_sheet_id = target_sheet["properties"]["sheetId"]
+
+        expand_requests = []
+
+        if required_rows > current_max_rows:
+            rows_to_add = required_rows - current_max_rows + 100  # add 100 extra buffer
+            logger.info(
+                f"[append_rows_by_headers] Sheet grid has {current_max_rows} rows but need {required_rows}. "
+                f"Expanding by {rows_to_add} rows."
+            )
+            expand_requests.append({
+                "appendDimension": {
+                    "sheetId": target_sheet_id,
+                    "dimension": "ROWS",
+                    "length": rows_to_add,
+                }
+            })
+
+        if required_cols > current_max_cols:
+            cols_to_add = required_cols - current_max_cols + 5  # add 5 extra buffer
+            logger.info(
+                f"[append_rows_by_headers] Sheet grid has {current_max_cols} cols but need {required_cols}. "
+                f"Expanding by {cols_to_add} columns."
+            )
+            expand_requests.append({
+                "appendDimension": {
+                    "sheetId": target_sheet_id,
+                    "dimension": "COLUMNS",
+                    "length": cols_to_add,
+                }
+            })
+
+        if expand_requests:
+            await asyncio.to_thread(
+                service.spreadsheets()
+                .batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"requests": expand_requests},
+                )
+                .execute
+            )
+            logger.info(f"[append_rows_by_headers] Sheet grid expanded successfully.")
+
     CHUNK_SIZE = 5000  # rows per request to avoid large payload timeouts
     total_rows_appended = 0
     total_cells_appended = 0
