@@ -8,7 +8,7 @@ import asyncio
 import io
 from typing import Optional, List
 
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaInMemoryUpload
 
 # Auth & server utilities
 from auth.service_decorator import require_google_service, require_multiple_services
@@ -288,6 +288,7 @@ async def create_doc(
     user_google_email: str,
     title: str,
     content: str = '',
+    content_type: str = 'text',
     folder_id: Optional[str] = None,
     folder_name_contains: Optional[str] = None,
     search_within_folder_id: Optional[str] = None,
@@ -301,6 +302,9 @@ async def create_doc(
         user_google_email (str): The user's Google email address. Required.
         title (str): The title for the new document. Required.
         content (str): Optional initial content to insert.
+        content_type (str): Format of content — 'text' for plain text (default), or 'html' for rich HTML content.
+            When 'html', the content is uploaded via Drive API with automatic conversion, preserving formatting
+            (headings, bold, italic, links, images with public URLs, lists, tables, etc.).
         folder_id (Optional[str]): Specific folder ID to place the document in.
         folder_name_contains (Optional[str]): Search for folder name containing this string. Uses the most recently modified match.
         search_within_folder_id (Optional[str]): When using folder_name_contains, limit search to within this parent folder. If not specified, searches all Drive.
@@ -310,13 +314,39 @@ async def create_doc(
     Returns:
         str: Confirmation message with document ID and link.
     """
-    logger.info(f"[create_doc] Invoked. Email: '{user_google_email}', Title='{title}'")
+    logger.info(f"[create_doc] Invoked. Email: '{user_google_email}', Title='{title}', content_type='{content_type}'")
 
-    doc = await asyncio.to_thread(docs_service.documents().create(body={'title': title}).execute)
-    doc_id = doc.get('documentId')
-    if content:
-        requests = [{'insertText': {'location': {'index': 1}, 'text': content}}]
-        await asyncio.to_thread(docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute)
+    if content and content_type == 'html':
+        if not content.strip().lower().startswith(('<!doctype', '<html')):
+            html_body = f'<html><head><meta charset="utf-8"><title>{title}</title></head><body>{content}</body></html>'
+        else:
+            html_body = content
+
+        media = MediaInMemoryUpload(
+            html_body.encode('utf-8'),
+            mimetype='text/html',
+            resumable=True
+        )
+
+        file_metadata = {
+            'name': title,
+            'mimeType': 'application/vnd.google-apps.document'
+        }
+
+        doc = await asyncio.to_thread(
+            drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute
+        )
+        doc_id = doc.get('id')
+    else:
+        doc = await asyncio.to_thread(docs_service.documents().create(body={'title': title}).execute)
+        doc_id = doc.get('documentId')
+        if content:
+            requests = [{'insertText': {'location': {'index': 1}, 'text': content}}]
+            await asyncio.to_thread(docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute)
     
     # Handle folder placement
     folder_info = ""
