@@ -289,6 +289,8 @@ async def create_doc(
     title: str,
     content: str = '',
     content_type: str = 'text',
+    save_raw_html: bool = False,
+    raw_html_subfolder: str = 'HTML',
     folder_id: Optional[str] = None,
     folder_name_contains: Optional[str] = None,
     search_within_folder_id: Optional[str] = None,
@@ -305,6 +307,9 @@ async def create_doc(
         content_type (str): Format of content — 'text' for plain text (default), or 'html' for rich HTML content.
             When 'html', the content is uploaded via Drive API with automatic conversion, preserving formatting
             (headings, bold, italic, links, images with public URLs, lists, tables, etc.).
+        save_raw_html (bool): When True and content_type is 'html', also saves the raw HTML as a .html file
+            in a subfolder (default 'HTML') inside the target folder. Defaults to False.
+        raw_html_subfolder (str): Name of the subfolder for raw HTML files. Defaults to 'HTML'.
         folder_id (Optional[str]): Specific folder ID to place the document in.
         folder_name_contains (Optional[str]): Search for folder name containing this string. Uses the most recently modified match.
         search_within_folder_id (Optional[str]): When using folder_name_contains, limit search to within this parent folder. If not specified, searches all Drive.
@@ -396,8 +401,55 @@ async def create_doc(
         if move_success and not folder_info:
             folder_info = f" | Moved to folder: {target_folder_id}"
     
+    # Save raw HTML copy if requested
+    html_info = ""
+    if save_raw_html and content and content_type == 'html':
+        try:
+            from gdrive.drive_helpers import find_or_create_folder_path as _find_or_create
+            from googleapiclient.http import MediaIoBaseUpload
+
+            html_parent_id = target_folder_id or 'root'
+
+            html_folder_result = await _find_or_create(
+                drive_service,
+                [raw_html_subfolder],
+                root_folder_id=html_parent_id,
+                create_missing=True
+            )
+            html_folder_id = html_folder_result['id'] if html_folder_result else html_parent_id
+
+            html_file_name = f"{title}.html"
+            if not content.strip().lower().startswith(('<!doctype', '<html')):
+                html_file_content = f'<html><head><meta charset="utf-8"><title>{title}</title></head><body>{content}</body></html>'
+            else:
+                html_file_content = content
+
+            html_media = MediaIoBaseUpload(
+                io.BytesIO(html_file_content.encode('utf-8')),
+                mimetype='text/html',
+                resumable=True
+            )
+            html_file_metadata = {
+                'name': html_file_name,
+                'parents': [html_folder_id],
+                'mimeType': 'text/html'
+            }
+            html_file = await asyncio.to_thread(
+                drive_service.files().create(
+                    body=html_file_metadata,
+                    media_body=html_media,
+                    fields='id, webViewLink'
+                ).execute
+            )
+            html_file_id = html_file.get('id')
+            html_info = f" | Raw HTML saved: '{html_file_name}' (ID: {html_file_id}) in /{raw_html_subfolder}/"
+            logger.info(f"Saved raw HTML file '{html_file_name}' (ID: {html_file_id}) in subfolder '{raw_html_subfolder}'")
+        except Exception as e:
+            html_info = f" | Warning: Failed to save raw HTML copy: {str(e)}"
+            logger.warning(f"Failed to save raw HTML copy: {e}", exc_info=True)
+
     link = f"https://docs.google.com/document/d/{doc_id}/edit"
-    msg = f"Created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}. Link: {link}{folder_info}"
+    msg = f"Created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}. Link: {link}{folder_info}{html_info}"
     logger.info(f"Successfully created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}. Link: {link}")
     return msg
 
