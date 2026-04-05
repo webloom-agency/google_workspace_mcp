@@ -7,6 +7,7 @@ This module provides MCP tools for interacting with the Gmail API.
 import logging
 import asyncio
 import base64
+import re
 import ssl
 from typing import Optional, List, Dict, Literal
 
@@ -139,6 +140,17 @@ def _extract_headers(payload: dict, header_names: List[str]) -> Dict[str, str]:
     return headers
 
 
+_HTML_TAG_PATTERN = re.compile(
+    r"<(?:h[1-6]|p|br|div|span|ul|ol|li|table|tr|td|th|a|b|i|u|strong|em|img|hr|blockquote|pre|code|html|body|head)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_html(text: str) -> bool:
+    """Return True if the text appears to contain HTML markup."""
+    return bool(_HTML_TAG_PATTERN.search(text))
+
+
 def _prepare_gmail_message(
     subject: str,
     body: str,
@@ -151,10 +163,11 @@ def _prepare_gmail_message(
 ) -> tuple[str, Optional[str]]:
     """
     Prepare a Gmail message with threading support.
+    Auto-detects HTML content and sets the appropriate MIME subtype.
 
     Args:
         subject: Email subject
-        body: Email body (plain text)
+        body: Email body (plain text or HTML)
         to: Optional recipient email address
         cc: Optional CC email address
         bcc: Optional BCC email address
@@ -170,8 +183,8 @@ def _prepare_gmail_message(
     if in_reply_to and not subject.lower().startswith('re:'):
         reply_subject = f"Re: {subject}"
 
-    # Prepare the email
-    message = MIMEText(body)
+    subtype = "html" if _looks_like_html(body) else "plain"
+    message = MIMEText(body, subtype)
     message["subject"] = reply_subject
 
     # Add recipients if provided
@@ -573,7 +586,7 @@ async def send_gmail_message(
     user_google_email: str,
     to: str = Body(..., description="Recipient email address."),
     subject: str = Body(..., description="Email subject."),
-    body: str = Body(..., description="Email body (plain text)."),
+    body: str = Body(..., description="Email body. Supports plain text or HTML (e.g. <b>, <h1>, <ul>). HTML is auto-detected."),
     cc: Optional[str] = Body(None, description="Optional CC email address."),
     bcc: Optional[str] = Body(None, description="Optional BCC email address."),
     thread_id: Optional[str] = Body(None, description="Optional Gmail thread ID to reply within."),
@@ -586,7 +599,7 @@ async def send_gmail_message(
     Args:
         to (str): Recipient email address.
         subject (str): Email subject.
-        body (str): Email body (plain text).
+        body (str): Email body (plain text or HTML). HTML tags are auto-detected.
         cc (Optional[str]): Optional CC email address.
         bcc (Optional[str]): Optional BCC email address.
         user_google_email (str): The user's Google email address. Required.
@@ -666,7 +679,7 @@ async def draft_gmail_message(
     service,
     user_google_email: str,
     subject: str = Body(..., description="Email subject."),
-    body: str = Body(..., description="Email body (plain text)."),
+    body: str = Body(..., description="Email body. Supports plain text or HTML (e.g. <b>, <h1>, <ul>). HTML is auto-detected."),
     to: Optional[str] = Body(None, description="Optional recipient email address."),
     cc: Optional[str] = Body(None, description="Optional CC email address."),
     bcc: Optional[str] = Body(None, description="Optional BCC email address."),
@@ -680,7 +693,7 @@ async def draft_gmail_message(
     Args:
         user_google_email (str): The user's Google email address. Required.
         subject (str): Email subject.
-        body (str): Email body (plain text).
+        body (str): Email body (plain text or HTML). HTML tags are auto-detected.
         to (Optional[str]): Optional recipient email address. Can be left empty for drafts.
         cc (Optional[str]): Optional CC email address.
         bcc (Optional[str]): Optional BCC email address.
