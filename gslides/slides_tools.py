@@ -450,3 +450,9 @@ read_slide_comments = read_presentation_comments
 create_slide_comment = create_presentation_comment
 reply_to_slide_comment = reply_to_presentation_comment
 resolve_slide_comment = resolve_presentation_comment
+
+
+# Register the high-level audit deck builder. The import has the side effect of
+# decorating `create_audit_presentation` with `@server.tool()`, so the MCP picks it up
+# whenever the slides module is loaded by main.py.
+from gslides.audit_builder import create_audit_presentation  # noqa: E402, F401

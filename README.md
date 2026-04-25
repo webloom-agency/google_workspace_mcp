@@ -762,6 +762,7 @@ cp .env.oauth21 .env
 | `list_spreadsheets` | Extended | List accessible spreadsheets |
 | `get_spreadsheet_info` | Extended | Get spreadsheet metadata |
 | `create_sheet` | Complete | Add sheets to existing files |
+| `add_chart` | Extended | Insert a native chart (BAR/COLUMN/LINE/AREA/PIE/DOUGHNUT/...) on a sheet from an existing data range, returning its `chart_id`. |
 | `*_sheet_comment` | Complete | Read/create/reply/resolve comments |
 
 </td>
@@ -772,6 +773,7 @@ cp .env.oauth21 .env
 | Tool | Tier | Description |
 |------|------|-------------|
 | `create_presentation` | **Core** | Create new presentations |
+| `create_audit_presentation` | **Core** | Build a full branded deck from one structured JSON payload (template + tables + images + native Sheets charts + speaker notes). [Schema & example below.](#create_audit_presentation-build-a-full-deck-from-structured-json) |
 | `get_presentation` | **Core** | Retrieve presentation details |
 | `batch_update_presentation` | Extended | Apply multiple updates |
 | `get_page` | Extended | Get specific slide information |
@@ -843,6 +845,159 @@ cp .env.oauth21 .env
 - <span style="color:#2d5b69">•</span> **Core**: Essential tools for basic functionality • Minimal API usage • Getting started
 - <span style="color:#72898f">•</span> **Extended**: Core tools + additional features • Regular usage • Expanded capabilities
 - <span style="color:#adbcbc">•</span> **Complete**: All available tools including advanced features • Power users • Full API access
+
+---
+
+### `create_audit_presentation`: build a full deck from structured JSON
+
+Designed for workflows (n8n, custom scripts, agents) that already produce structured audit data
+and need to ship it as a branded Google Slides deck without writing any Slides API code.
+
+One MCP call → whole deck. No iteration. The tool handles template copying, hidden data sheet
+creation, native Sheets chart generation, slide layout, speaker notes, folder placement, and
+rollback on failure. Slides API requests are chunked internally to stay under per-batch limits;
+50 slides take ~30–60 seconds end-to-end.
+
+#### Template contract
+
+You provide the `template_presentation_id` of any Google Slides file. The tool calls
+`drive.files.copy()` so the new deck inherits the template's master, layouts, theme colors and
+fonts. The template is **never modified**.
+
+- Use Google's predefined layouts (`TITLE`, `TITLE_AND_BODY`, `BLANK`, `SECTION_HEADER`,
+  `BIG_NUMBER`, `TITLE_AND_TWO_COLUMNS`, ...) or custom layouts referenced by display name.
+- No `{{placeholders}}` needed in the template — content is generated programmatically.
+- Required scope: `https://www.googleapis.com/auth/drive` (to copy a user-supplied template that
+  the app didn't originally create). The tool requests this scope automatically; expect a
+  re-consent screen the first time it runs.
+
+#### `deck` JSON schema
+
+```json
+{
+  "title": "Pré-audit SEO - edaa.fr - 2026-04",
+  "slides": [
+    {
+      "layout": "TITLE",
+      "fields": { "title": "Pré-audit SEO", "subtitle": "edaa.fr — Avril 2026" }
+    },
+    {
+      "layout": "TITLE_AND_BODY",
+      "fields": {
+        "title": "Synthèse exécutive",
+        "body": "Le site edaa.fr affiche un score global SEO de 59..."
+      },
+      "speaker_notes": "Insister sur l'écart pilier GEO/IA (10/100)."
+    },
+    {
+      "layout": "BLANK",
+      "title": "KPIs principaux",
+      "table": {
+        "headers": ["Métrique", "Valeur"],
+        "rows": [
+          ["Score global /100", "59"],
+          ["Trafic mensuel (visites)", "8847"],
+          ["CA mensuel estimé (€)", "176 940"],
+          ["Évolution trafic 12 mois", "-36.1%"]
+        ],
+        "position": { "x": 50, "y": 100, "w": 600, "h": 250 }
+      }
+    },
+    {
+      "layout": "BLANK",
+      "title": "Scores par pilier",
+      "chart": {
+        "type": "COLUMN",
+        "title": "Scores SEO par pilier (/100)",
+        "value_axis_title": "Score",
+        "data": {
+          "headers": ["Pilier", "Score"],
+          "rows": [
+            ["Technique & Performance", 90],
+            ["Contenu", 64],
+            ["Backlinks", 57],
+            ["GEO / Visibilité IA", 10]
+          ]
+        },
+        "position": { "x": 60, "y": 100, "w": 600, "h": 280 }
+      }
+    },
+    {
+      "layout": "SECTION_HEADER",
+      "fields": { "title": "Recommandations" }
+    },
+    {
+      "layout": "BLANK",
+      "title": "Capture homepage",
+      "image": {
+        "url": "https://drive.google.com/uc?export=view&id=FILE_ID",
+        "position": { "x": 60, "y": 100, "w": 600, "h": 280 }
+      }
+    }
+  ]
+}
+```
+
+**Slide types** (combine fields freely on a single slide):
+
+| Field | Purpose |
+|---|---|
+| `layout` | Predefined layout name (`TITLE`, `TITLE_AND_BODY`, `BLANK`, `SECTION_HEADER`, `BIG_NUMBER`, ...) or a custom template layout's display name. |
+| `fields.title` / `fields.subtitle` / `fields.body` | Fills the matching layout placeholders. |
+| `title` (top-level, on `BLANK`) | Adds a free-floating title text box. |
+| `table` | `{headers, rows, position?, header_style?, body_style?}` — creates a real `Table` element you can re-style by hand later. |
+| `chart` | `{type, title?, data:{headers, rows}, position?, value_axis_title?, domain_axis_title?, legend_position?, width_pixels?, height_pixels?}` — becomes a native Sheets chart embedded as `LINKED`, so refreshing the Sheet refreshes the deck. |
+| `image` | `{url, position?}` — must be a publicly accessible URL. |
+| `text_boxes` | List of `{text, position?, style?, alignment?}` for free placement. |
+| `speaker_notes` | Plain text added to the slide's notes page. |
+
+**Supported chart types**: `BAR`, `COLUMN`, `LINE`, `AREA`, `SCATTER`, `COMBO`, `STEPPED_AREA`, `PIE`, `DOUGHNUT`. Convention: column 0 of `data.rows` is the X axis (or pie domain); remaining columns are series.
+
+Coordinates use **points (PT)**. The default page is 720 × 405 PT (standard widescreen).
+
+#### Example call
+
+```json
+{
+  "user_google_email": "francois@webloom.fr",
+  "template_presentation_id": "1AbCdEfGhIjKlMnOpQrStUvWxYz",
+  "folder_path": ["CLIENTS", "edaa.fr", "SEO"],
+  "create_folders_if_missing": true,
+  "if_exists": "create_new",
+  "deck": { "title": "Pré-audit SEO - edaa.fr", "slides": [ /* ... */ ] }
+}
+```
+
+Response (JSON string):
+
+```json
+{
+  "presentation_id": "1XYZ...",
+  "presentation_url": "https://docs.google.com/presentation/d/1XYZ.../edit",
+  "slide_count": 15,
+  "data_sheet_url": "https://docs.google.com/spreadsheets/d/1ABC.../edit",
+  "data_sheet_id": "1ABC...",
+  "folder_id": "0B...",
+  "folder_path": "CLIENTS > edaa.fr > SEO",
+  "title": "Pré-audit SEO - edaa.fr",
+  "message": "Created audit presentation 'Pré-audit SEO - edaa.fr' with 15 slide(s) for francois@webloom.fr. Folder: CLIENTS > edaa.fr > SEO. Data sheet with 4 chart(s): https://..."
+}
+```
+
+#### Other parameters
+
+- `folder_id` / `folder_path` — pick one. `folder_path` walks/creates nested folders (great for `["CLIENTS", "<domain>", "SEO"]`).
+- `if_exists` — `"create_new"` (default; appends a UTC timestamp to the title if a duplicate exists in the folder), `"replace"` (deletes the existing same-titled deck first), or `"skip"` (returns the existing deck untouched).
+- `cleanup_data_sheet` — set to `true` to delete the auxiliary Sheet after the deck is built. Default `false` so charts remain refreshable.
+
+#### Limits & sweet spot
+
+- 1–30 slides: ~10–20 s, single Slides batch.
+- 30–80 slides: ~30–60 s, automatically chunked.
+- 80–150 slides: ~60–120 s, technically fine but consider splitting into multiple decks per audit pillar.
+- > 150 slides: split.
+
+On any failure after the template copy, the tool best-effort deletes the partial deck and data sheet so retries don't accumulate orphans.
 
 ---
 

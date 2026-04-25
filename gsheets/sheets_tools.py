@@ -1406,6 +1406,223 @@ async def deduplicate_rows_by_headers(
         f"Deduplicated sheet '{target_title}' by keys {key_headers_list}, keeping {keep_normalized} of '{sort_header}'."
     )
 
+# Supported chart types and their API mapping
+_BASIC_CHART_TYPES = {"BAR", "COLUMN", "LINE", "AREA", "SCATTER", "COMBO", "STEPPED_AREA"}
+_PIE_CHART_TYPES = {"PIE", "DOUGHNUT"}
+
+
+def _resolve_sheet_id_by_name(spreadsheet: Dict[str, Any], sheet_name: str) -> int:
+    """Find a sheetId by sheet title (exact, then normalized)."""
+    sheets = spreadsheet.get("sheets", [])
+    for s in sheets:
+        if s.get("properties", {}).get("title") == sheet_name:
+            return s["properties"]["sheetId"]
+    norm = " ".join(sheet_name.split()).lower()
+    for s in sheets:
+        title = s.get("properties", {}).get("title", "")
+        if " ".join(title.split()).lower() == norm:
+            return s["properties"]["sheetId"]
+    available = [s.get("properties", {}).get("title", "") for s in sheets]
+    raise Exception(f"Sheet '{sheet_name}' not found. Available: {available}")
+
+
+@server.tool()
+@handle_http_errors("add_chart", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def add_chart(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    sheet_name: str,
+    chart_type: str,
+    data_rows: int,
+    data_columns: int,
+    title: Optional[str] = None,
+    start_row_index: int = 0,
+    start_column_index: int = 0,
+    has_header: bool = True,
+    legend_position: str = "BOTTOM_LEGEND",
+    domain_axis_title: Optional[str] = None,
+    value_axis_title: Optional[str] = None,
+    anchor_row_index: Optional[int] = None,
+    anchor_column_index: Optional[int] = None,
+    width_pixels: int = 600,
+    height_pixels: int = 371,
+    series_colors: Optional[List[str]] = None,
+) -> str:
+    """
+    Adds a native chart to a Google Sheets sheet using the data already present in a contiguous range.
+
+    Convention used for the data range:
+      - Domain (X axis) = first column of the range.
+      - Series = remaining columns. One series per column.
+      - If has_header=True, row 0 of the range is treated as headers (legend labels) and excluded from values.
+
+    Args:
+        user_google_email: The user's Google email address. Required.
+        spreadsheet_id: ID of the target spreadsheet. Required.
+        sheet_name: Title of the sheet that holds the data and will host the chart. Required.
+        chart_type: One of BAR, COLUMN, LINE, AREA, SCATTER, COMBO, STEPPED_AREA, PIE, DOUGHNUT. Required.
+        data_rows: Total number of rows in the source range, including the header row if any. Required.
+        data_columns: Total number of columns in the source range (>=2). Required.
+        title: Optional chart title.
+        start_row_index: 0-based row index where the data range starts. Defaults to 0.
+        start_column_index: 0-based column index where the data range starts. Defaults to 0.
+        has_header: If True, the first row of the range is treated as headers. Defaults to True.
+        legend_position: One of BOTTOM_LEGEND, LEFT_LEGEND, RIGHT_LEGEND, TOP_LEGEND, NO_LEGEND. Defaults to BOTTOM_LEGEND.
+        domain_axis_title: Optional title for the domain (X) axis (basic charts only).
+        value_axis_title: Optional title for the value (Y) axis (basic charts only).
+        anchor_row_index: 0-based row where the chart's top-left overlay anchor is placed. Defaults to start_row_index.
+        anchor_column_index: 0-based column where the chart's top-left overlay anchor is placed. Defaults to start_column_index + data_columns + 1.
+        width_pixels: Chart width in pixels. Defaults to 600.
+        height_pixels: Chart height in pixels. Defaults to 371.
+        series_colors: Optional list of HEX colors (e.g. ["#1A73E8", "#34A853"]) applied to series in order. Extra colors are ignored.
+
+    Returns:
+        str: JSON string containing chart_id, spreadsheet_id, sheet_id, and a confirmation message.
+    """
+    logger.info(
+        f"[add_chart] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, "
+        f"Sheet: '{sheet_name}', Type: {chart_type}, Rows: {data_rows}, Cols: {data_columns}"
+    )
+
+    chart_type_upper = chart_type.strip().upper()
+    if chart_type_upper not in _BASIC_CHART_TYPES and chart_type_upper not in _PIE_CHART_TYPES:
+        raise Exception(
+            f"Unsupported chart_type '{chart_type}'. Supported: "
+            f"{sorted(_BASIC_CHART_TYPES | _PIE_CHART_TYPES)}"
+        )
+    if data_columns < 2:
+        raise Exception("'data_columns' must be >= 2 (one column for the domain, at least one for series).")
+    if data_rows < (2 if has_header else 1):
+        raise Exception("'data_rows' must contain at least one data row (plus header if has_header=True).")
+
+    spreadsheet = await asyncio.to_thread(
+        service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute
+    )
+    sheet_id = _resolve_sheet_id_by_name(spreadsheet, sheet_name)
+
+    end_row_index = start_row_index + data_rows
+    end_column_index = start_column_index + data_columns
+
+    domain_source = {
+        "sheetId": sheet_id,
+        "startRowIndex": start_row_index,
+        "endRowIndex": end_row_index,
+        "startColumnIndex": start_column_index,
+        "endColumnIndex": start_column_index + 1,
+    }
+
+    series_sources = [
+        {
+            "sheetId": sheet_id,
+            "startRowIndex": start_row_index,
+            "endRowIndex": end_row_index,
+            "startColumnIndex": start_column_index + i,
+            "endColumnIndex": start_column_index + i + 1,
+        }
+        for i in range(1, data_columns)
+    ]
+
+    def _hex_to_color(hex_color: str) -> Dict[str, float]:
+        h = hex_color.lstrip("#")
+        if len(h) != 6:
+            raise Exception(f"Invalid HEX color '{hex_color}'. Expected #RRGGBB.")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return {"red": r / 255.0, "green": g / 255.0, "blue": b / 255.0}
+
+    chart_spec: Dict[str, Any] = {}
+    if title:
+        chart_spec["title"] = title
+
+    if chart_type_upper in _BASIC_CHART_TYPES:
+        axis: List[Dict[str, Any]] = []
+        if domain_axis_title:
+            axis.append({"position": "BOTTOM_AXIS", "title": domain_axis_title})
+        if value_axis_title:
+            axis.append({"position": "LEFT_AXIS", "title": value_axis_title})
+
+        series_list: List[Dict[str, Any]] = []
+        for idx, src in enumerate(series_sources):
+            series_entry: Dict[str, Any] = {
+                "series": {"sourceRange": {"sources": [src]}},
+                "targetAxis": "LEFT_AXIS",
+            }
+            if series_colors and idx < len(series_colors):
+                series_entry["color"] = _hex_to_color(series_colors[idx])
+            series_list.append(series_entry)
+
+        chart_spec["basicChart"] = {
+            "chartType": chart_type_upper,
+            "legendPosition": legend_position,
+            "headerCount": 1 if has_header else 0,
+            "domains": [{"domain": {"sourceRange": {"sources": [domain_source]}}}],
+            "series": series_list,
+        }
+        if axis:
+            chart_spec["basicChart"]["axis"] = axis
+    else:
+        # PIE / DOUGHNUT use only the first series column
+        first_series_source = series_sources[0]
+        chart_spec["pieChart"] = {
+            "legendPosition": legend_position,
+            "domain": {"sourceRange": {"sources": [domain_source]}},
+            "series": {"sourceRange": {"sources": [first_series_source]}},
+        }
+        if chart_type_upper == "DOUGHNUT":
+            # Sheets API exposes a doughnut via pieHole on the pie chart
+            chart_spec["pieChart"]["pieHole"] = 0.5
+
+    if anchor_row_index is None:
+        anchor_row_index = start_row_index
+    if anchor_column_index is None:
+        anchor_column_index = end_column_index + 1
+
+    add_chart_request = {
+        "addChart": {
+            "chart": {
+                "spec": chart_spec,
+                "position": {
+                    "overlayPosition": {
+                        "anchorCell": {
+                            "sheetId": sheet_id,
+                            "rowIndex": anchor_row_index,
+                            "columnIndex": anchor_column_index,
+                        },
+                        "widthPixels": width_pixels,
+                        "heightPixels": height_pixels,
+                    }
+                },
+            }
+        }
+    }
+
+    response = await asyncio.to_thread(
+        service.spreadsheets()
+        .batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": [add_chart_request]})
+        .execute
+    )
+
+    replies = response.get("replies", [])
+    if not replies or "addChart" not in replies[0]:
+        raise Exception("Sheets API did not return a chartId after addChart.")
+    chart_id = replies[0]["addChart"]["chart"]["chartId"]
+
+    result = {
+        "chart_id": chart_id,
+        "spreadsheet_id": spreadsheet_id,
+        "sheet_id": sheet_id,
+        "sheet_name": sheet_name,
+        "chart_type": chart_type_upper,
+        "message": (
+            f"Added {chart_type_upper} chart (ID: {chart_id}) to sheet '{sheet_name}' "
+            f"in spreadsheet {spreadsheet_id}."
+        ),
+    }
+    logger.info(f"[add_chart] Created chart {chart_id} on sheet '{sheet_name}'.")
+    return json.dumps(result, indent=2)
+
+
 # Create comment management tools for sheets
 _comment_tools = create_comment_tools("spreadsheet", "spreadsheet_id")
 
