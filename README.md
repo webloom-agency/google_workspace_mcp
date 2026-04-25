@@ -989,6 +989,7 @@ Response (JSON string):
 - `folder_id` / `folder_path` — pick one. `folder_path` walks/creates nested folders (great for `["CLIENTS", "<domain>", "SEO"]`).
 - `if_exists` — `"create_new"` (default; appends a UTC timestamp to the title if a duplicate exists in the folder), `"replace"` (deletes the existing same-titled deck first), or `"skip"` (returns the existing deck untouched).
 - `cleanup_data_sheet` — set to `true` to delete the auxiliary Sheet after the deck is built. Default `false` so charts remain refreshable.
+- `keep_template_slides` — default `false` (the copied template is wiped first, only the generated slides remain). Set to `true` to **preserve every slide already in the template** and append the generated ones AFTER them. Use this when your template ships with fixed boilerplate (cover, methodology, "À propos", legal mentions, …) that should appear in every audit deck. The original template file is never touched either way; this only controls what happens to the *copy*.
 
 #### Limits & sweet spot
 

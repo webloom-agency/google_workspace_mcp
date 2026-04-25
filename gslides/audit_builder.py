@@ -376,6 +376,7 @@ async def create_audit_presentation(
     create_folders_if_missing: bool = True,
     if_exists: str = "create_new",
     cleanup_data_sheet: bool = False,
+    keep_template_slides: bool = False,
 ) -> str:
     """
     Build a full Google Slides deck from a structured JSON payload, copying a template for branding.
@@ -426,6 +427,11 @@ async def create_audit_presentation(
             folder), or "skip" (return existing deck untouched). Default "create_new".
         cleanup_data_sheet: If True, delete the data Sheet after the deck is built. Default False
             so charts remain refreshable.
+        keep_template_slides: If True, the slides already present in the copied template are
+            preserved and the generated slides are appended AFTER them. Default False (the
+            template copy is wiped first so the deck only contains generated slides). Use this
+            when the template ships with fixed boilerplate (cover, methodology, about-us, ...)
+            that should appear in every audit deck.
 
     Returns:
         str: JSON string with presentation_id, presentation_url, slide_count, data_sheet_url,
@@ -522,8 +528,9 @@ async def create_audit_presentation(
                 drive_service, presentation_id, target_folder_id, file_name=final_title
             )
 
-        # 5) Strip whatever slides the template ships with so we have a clean canvas.
-        await _strip_existing_slides(slides_service, presentation_id)
+        # 5) Either wipe the template's slides (clean canvas) or keep them (boilerplate mode).
+        if not keep_template_slides:
+            await _strip_existing_slides(slides_service, presentation_id)
 
         # 6) If any slide needs a chart, build the data Sheet first.
         flat_chart_specs = _annotate_chart_uids(deck)
@@ -543,6 +550,10 @@ async def create_audit_presentation(
             slides_service.presentations().get(presentationId=presentation_id).execute
         )
 
+        # When keeping template slides, append generated slides at the end so the boilerplate
+        # (cover, methodology, ...) stays in front. Otherwise the template is already empty.
+        slide_offset = len(presentation.get("slides", []) or []) if keep_template_slides else 0
+
         all_requests: List[Dict[str, Any]] = []
         slide_id_index_pairs: List[Tuple[str, int]] = []
 
@@ -550,7 +561,7 @@ async def create_audit_presentation(
             slide_id, slide_requests, _placeholders = B.build_slide_with_placeholders(
                 presentation=presentation,
                 slide_spec=slide_spec,
-                insertion_index=index,
+                insertion_index=slide_offset + index,
             )
             slide_id_index_pairs.append((slide_id, index))
 
@@ -586,9 +597,12 @@ async def create_audit_presentation(
             slide_objs = updated_presentation.get("slides", []) or []
             notes_requests: List[Dict[str, Any]] = []
             for i, notes_text in notes_specs:
-                if i >= len(slide_objs):
+                actual_index = slide_offset + i
+                if actual_index >= len(slide_objs):
                     continue
-                notes_page = slide_objs[i].get("slideProperties", {}).get("notesPage") or {}
+                notes_page = (
+                    slide_objs[actual_index].get("slideProperties", {}).get("notesPage") or {}
+                )
                 speaker_notes_id = (
                     notes_page.get("notesProperties", {}).get("speakerNotesObjectId")
                 )
