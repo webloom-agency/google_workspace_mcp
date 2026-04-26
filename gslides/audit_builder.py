@@ -34,12 +34,14 @@ from gslides import _builders as B
 
 logger = logging.getLogger(__name__)
 
-# Slides `batchUpdate` is sensitive to large request lists — placeholder mappings
-# and createSlide+text inserts in the same batch can trigger transient 500s when
-# the batch grows. 75 requests per batch keeps each call well under Google's
-# soft limits and means a single transient failure only forces a retry of a
-# small slice of work.
-MAX_REQUESTS_PER_BATCH = 75
+# Slides `batchUpdate` becomes unreliable when many `createSlide` calls are
+# stacked in one batch alongside dependent `insertText` / `createTable` /
+# `replaceImage` requests — Google's backend regularly returns deterministic
+# HTTP 500s on such mixed batches for decks of ~25+ slides. We therefore split
+# the build into two homogeneous phases (creation, then content) and keep
+# batches small. 30 requests per batch is conservative but rock-solid even for
+# 100-slide decks.
+MAX_REQUESTS_PER_BATCH = 30
 # Per-call addChart batches stay comfortably under Sheets quota.
 MAX_CHARTS_PER_SHEETS_BATCH = 20
 # Inter-batch pause to avoid bursting Slides/Sheets quota over many chunks.
@@ -759,16 +761,25 @@ async def create_audit_presentation(
         # (cover, methodology, ...) stays in front. Otherwise the template is already empty.
         slide_offset = len(presentation.get("slides", []) or []) if keep_template_slides else 0
 
-        all_requests: List[Dict[str, Any]] = []
+        # Two-phase build: ALL `createSlide` requests first (cheap, predictable,
+        # no in-batch dependencies), then ALL content requests in a second pass
+        # (insertText, updateTextStyle, createTable, createShape, createImage,
+        # createSheetsChart, replaceImage). This eliminates the deterministic
+        # HTTP 500s Google returns when createSlide and dependent inserts are
+        # interleaved in the same batchUpdate.
+        creation_requests: List[Dict[str, Any]] = []
+        content_requests: List[Dict[str, Any]] = []
         slide_id_index_pairs: List[Tuple[str, int]] = []
 
         for index, slide_spec in enumerate(slides):
-            slide_id, slide_requests, _placeholders = B.build_slide_with_placeholders(
+            slide_id, slide_creation, slide_content, _placeholders = B.build_slide_with_placeholders(
                 presentation=presentation,
                 slide_spec=slide_spec,
                 insertion_index=slide_offset + index,
             )
             slide_id_index_pairs.append((slide_id, index))
+            creation_requests.extend(slide_creation)
+            content_requests.extend(slide_content)
 
             chart_spec = slide_spec.get("chart")
             if chart_spec:
@@ -778,7 +789,9 @@ async def create_audit_presentation(
                     raise Exception(
                         f"Internal error: chart for slide #{index + 1} was not created."
                     )
-                slide_requests.extend(
+                # createSheetsChart targets a slide that must already exist, so
+                # it runs in the content phase too.
+                content_requests.extend(
                     B.build_sheets_chart_requests(
                         slide_id=slide_id,
                         spreadsheet_id=data_sheet_meta["spreadsheet_id"],
@@ -787,9 +800,12 @@ async def create_audit_presentation(
                     )
                 )
 
-            all_requests.extend(slide_requests)
-
-        await _execute_slides_batches(slides_service, presentation_id, all_requests)
+        # Phase A: create all slides first.
+        await _execute_slides_batches(slides_service, presentation_id, creation_requests)
+        # Phase B: fill every slide's content. By now every slide and every
+        # placeholder objectId we pre-allocated is fully committed, so these
+        # inserts/updates can never race a dependency.
+        await _execute_slides_batches(slides_service, presentation_id, content_requests)
 
         # 8) Speaker notes pass: re-fetch to find each slide's speakerNotesObjectId, then insert.
         notes_specs: List[Tuple[int, str]] = [

@@ -377,13 +377,26 @@ def build_slide_with_placeholders(
     presentation: Dict[str, Any],
     slide_spec: Dict[str, Any],
     insertion_index: Optional[int] = None,
-) -> Tuple[str, List[Dict[str, Any]], Dict[str, str]]:
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, str]]:
     """Build the createSlide + placeholder text-fill + extra-element requests for ONE slide.
 
+    The returned requests are split into two phases so the caller can run *every*
+    `createSlide` first (in its own batch) and *every* content mutation second.
+    Mixing slide creation with dependent text inserts / table fills in a single
+    Slides batchUpdate is the canonical trigger for HTTP 500s on larger decks
+    (each createSlide forces placeholder ID materialization + layout inheritance,
+    and stacking many of those next to dependent inserts in one batch is fragile).
+
     Returns:
-        (slide_id, requests, placeholder_ids)
-        placeholder_ids maps semantic names ("title", "subtitle", "body") to the
-        objectIds we assigned via `placeholderIdMappings`.
+        (slide_id, creation_requests, content_requests, placeholder_ids)
+        - creation_requests: the single `createSlide` request for this slide.
+        - content_requests: insertText, updateTextStyle, createTable (+ cell
+          inserts), createShape (text boxes), createImage, replaceImage. Every
+          one of these references either the slide itself or a placeholder
+          objectId we pre-allocated, so they only need the createSlide phase
+          to be committed first.
+        - placeholder_ids: maps semantic names ("title", "subtitle", "body[i]",
+          "image[i]") to the objectIds we assigned via `placeholderIdMappings`.
     """
     slide_id = gen_id("sl")
     layout_name = slide_spec.get("layout") or "BLANK"
@@ -454,7 +467,7 @@ def build_slide_with_placeholders(
         )
         image_fill.append((ph_id, spec))
 
-    requests: List[Dict[str, Any]] = [
+    creation_requests: List[Dict[str, Any]] = [
         build_create_slide(
             slide_id=slide_id,
             layout_reference=layout_ref,
@@ -462,6 +475,7 @@ def build_slide_with_placeholders(
             placeholder_id_mappings=placeholder_mappings or None,
         )
     ]
+    content_requests: List[Dict[str, Any]] = []
 
     # Fill simple single-instance text placeholders.
     for field_name in simple_text_fields:
@@ -470,7 +484,7 @@ def build_slide_with_placeholders(
             continue
         text = str(fields.get(field_name) or "")
         style = (slide_spec.get("styles") or {}).get(field_name)
-        requests.extend(build_text_insert_requests(ph_id, text, style))
+        content_requests.extend(build_text_insert_requests(ph_id, text, style))
 
     # Fill BODY placeholder(s). Style may be a single dict (applied to all
     # body shapes) or a list aligned with the body texts.
@@ -483,7 +497,7 @@ def build_slide_with_placeholders(
             style = body_style[i] if i < len(body_style) else None
         else:
             style = body_style
-        requests.extend(build_text_insert_requests(ph_id, body_text, style))
+        content_requests.extend(build_text_insert_requests(ph_id, body_text, style))
 
     # Fill PICTURE placeholder(s) via replaceImage. The placeholder we mapped
     # is created on the slide as an Image element holding the layout's
@@ -491,7 +505,7 @@ def build_slide_with_placeholders(
     # preserving the placeholder's size, position, and crop.
     for ph_id, spec in image_fill:
         method = spec.get("method") or "CENTER_INSIDE"
-        requests.append(
+        content_requests.append(
             {
                 "replaceImage": {
                     "imageObjectId": ph_id,
@@ -510,13 +524,13 @@ def build_slide_with_placeholders(
             position={"x": 40.0, "y": 30.0, "w": DEFAULT_PAGE_W_PT - 80.0, "h": 50.0},
             style={"bold": True, "fontSize": {"magnitude": 22, "unit": "PT"}},
         )
-        requests.extend(title_requests)
+        content_requests.extend(title_requests)
 
     if "table" in slide_spec and slide_spec["table"]:
-        requests.extend(build_table_requests(slide_id, slide_spec["table"]))
+        content_requests.extend(build_table_requests(slide_id, slide_spec["table"]))
 
     if "image" in slide_spec and slide_spec["image"]:
-        requests.extend(build_image_requests(slide_id, slide_spec["image"]))
+        content_requests.extend(build_image_requests(slide_id, slide_spec["image"]))
 
     if "text_boxes" in slide_spec and slide_spec["text_boxes"]:
         for tb in slide_spec["text_boxes"]:
@@ -532,6 +546,6 @@ def build_slide_with_placeholders(
                 style=tb.get("style"),
                 paragraph_alignment=tb.get("alignment"),
             )
-            requests.extend(tb_requests)
+            content_requests.extend(tb_requests)
 
-    return slide_id, requests, placeholder_ids
+    return slide_id, creation_requests, content_requests, placeholder_ids
