@@ -220,12 +220,28 @@ def _build_chart_addchart_request(
             axis.append({"position": "LEFT_AXIS", "title": chart_spec["value_axis_title"]})
 
         series_palette = style.get("series_colors") or []
+        # COMBO charts require each series to specify its own type. Without
+        # that, Sheets rejects the request with "No basic chart type specified"
+        # (a misleading wording that really refers to per-series type).
+        # Default mapping: first series = COLUMN, others = LINE. Callers may
+        # override via `chart.series_types: ["COLUMN", "LINE", ...]`.
+        per_series_types: List[str] = []
+        if chart_type == "COMBO":
+            override = chart_spec.get("series_types") or []
+            for idx in range(len(series_sources)):
+                if idx < len(override) and override[idx]:
+                    per_series_types.append(str(override[idx]).upper())
+                else:
+                    per_series_types.append("COLUMN" if idx == 0 else "LINE")
+
         series_list: List[Dict[str, Any]] = []
         for idx, src in enumerate(series_sources):
             series_entry: Dict[str, Any] = {
                 "series": {"sourceRange": {"sources": [src]}},
                 "targetAxis": "LEFT_AXIS",
             }
+            if per_series_types:
+                series_entry["type"] = per_series_types[idx]
             if series_palette:
                 color_hex = series_palette[idx % len(series_palette)]
                 series_entry["colorStyle"] = {"rgbColor": _hex_to_rgb_color(color_hex)}
