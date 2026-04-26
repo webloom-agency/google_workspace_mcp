@@ -521,6 +521,53 @@ async def _execute_slides_batches(
             await asyncio.sleep(INTER_BATCH_SLEEP_S)
 
 
+# Slides request types whose payload references an OBJECT THAT MUST ALREADY
+# EXIST on the slide (typically a placeholder objectId we pre-allocated via
+# `placeholderIdMappings`). If that object never materialized — which happens
+# silently when a `layoutPlaceholder` mapping doesn't match the layout's real
+# placeholders — the request will fail. Slides returns generic HTTP 500 for
+# this case (instead of a proper 400), so we filter these requests out
+# defensively after Phase A using a refetched view of the presentation.
+_OBJECT_REFERENCING_REQUEST_FIELDS: Dict[str, str] = {
+    "insertText": "objectId",
+    "deleteText": "objectId",
+    "updateTextStyle": "objectId",
+    "updateParagraphStyle": "objectId",
+    "createParagraphBullets": "objectId",
+    "deleteParagraphBullets": "objectId",
+    "updateShapeProperties": "objectId",
+    "updateImageProperties": "objectId",
+    "replaceImage": "imageObjectId",
+    "deleteObject": "objectId",
+}
+
+
+def _extract_target_object_id(request: Dict[str, Any]) -> Optional[str]:
+    """Return the objectId a Slides request expects to ALREADY exist, or None.
+
+    Only used to filter Phase B requests against a live view of the
+    presentation. Requests that *create* a new object (createShape,
+    createTable, createImage, createSheetsChart, createSlide) reference
+    the slide via `pageObjectId`, which is always pre-allocated by us and
+    confirmed to exist after Phase A — those are intentionally not filtered.
+    """
+    for kind, field in _OBJECT_REFERENCING_REQUEST_FIELDS.items():
+        if kind in request:
+            return (request[kind] or {}).get(field)
+    return None
+
+
+def _collect_existing_object_ids(presentation: Dict[str, Any]) -> set:
+    """Return every pageElement objectId currently materialized in the deck."""
+    out: set = set()
+    for page in presentation.get("slides", []) or []:
+        for el in page.get("pageElements", []) or []:
+            oid = el.get("objectId")
+            if oid:
+                out.add(oid)
+    return out
+
+
 async def _execute_slides_per_slide(
     slides_service,
     presentation_id: str,
@@ -631,6 +678,7 @@ async def create_audit_presentation(
     if_exists: str = "create_new",
     cleanup_data_sheet: bool = False,
     keep_template_slides: bool = False,
+    keep_on_error: bool = False,
 ) -> str:
     """
     Build a full Google Slides deck from a structured JSON payload, copying a template for branding.
@@ -704,6 +752,11 @@ async def create_audit_presentation(
             template copy is wiped first so the deck only contains generated slides). Use this
             when the template ships with fixed boilerplate (cover, methodology, about-us, ...)
             that should appear in every audit deck.
+        keep_on_error: If True, the partial deck (and data sheet) are NOT deleted when the build
+            fails. Use this for debugging — open the half-built file in Drive to see exactly
+            which slides made it and inspect the resulting placeholder/objectId state. Default
+            False so production retries don't accumulate orphan files. The presentation_id of
+            the kept partial is logged at WARNING level so it's easy to find.
 
     Returns:
         str: JSON string with presentation_id, presentation_url, slide_count, data_sheet_url,
@@ -928,6 +981,40 @@ async def create_audit_presentation(
             f"[create_audit_presentation] Copy layouts: "
             f"{json.dumps(copy_layouts_trace, ensure_ascii=False)}"
         )
+        # Dump the EXACT placeholders each layout exposes (type + index +
+        # objectId). This is critical for debugging two-column / multi-body
+        # layouts: if our `placeholderIdMappings` references a (type, index)
+        # combo the layout doesn't actually expose, the Slides backend
+        # silently drops the mapping at createSlide time AND THEN returns
+        # generic HTTP 500 on any insertText / replaceImage that targets the
+        # never-bound objectId. Logging the truth here makes the cause
+        # immediately visible from the server logs.
+        layout_placeholders_trace: List[Dict[str, Any]] = []
+        for layout in presentation.get("layouts") or []:
+            props = layout.get("layoutProperties") or {}
+            phs: List[Dict[str, Any]] = []
+            for el in layout.get("pageElements") or []:
+                placeholder = (el.get("shape") or {}).get("placeholder") or {}
+                if not placeholder:
+                    continue
+                phs.append(
+                    {
+                        "type": placeholder.get("type"),
+                        "index": placeholder.get("index", 0),
+                        "objectId": el.get("objectId"),
+                    }
+                )
+            layout_placeholders_trace.append(
+                {
+                    "displayName": props.get("displayName"),
+                    "objectId": layout.get("objectId"),
+                    "placeholders": phs,
+                }
+            )
+        logger.info(
+            f"[create_audit_presentation] Copy layout placeholders (type/index/objectId): "
+            f"{json.dumps(layout_placeholders_trace, ensure_ascii=False)}"
+        )
 
         # Re-resolve every slide's layout against the COPY (not the template)
         # and log the resolution path. If anything resolves to predefinedLayout
@@ -1041,6 +1128,76 @@ async def create_audit_presentation(
             creation_requests,
             label_prefix="slides.createSlide",
         )
+
+        # Verification pass: refetch the deck and confirm every pre-allocated
+        # placeholder objectId actually materialized. Custom layouts (esp.
+        # two-column / multi-body) sometimes silently drop a placeholder
+        # mapping at createSlide time — the API returns 200 and a slide is
+        # created, but the placeholder we asked for is never bound. Any
+        # downstream insertText / replaceImage targeting that ghost objectId
+        # then triggers a generic HTTP 500 ("Internal error encountered")
+        # for the entire batchUpdate. Filtering those orphans here turns a
+        # hard failure into a logged warning while keeping the rest of the
+        # slide intact.
+        verify_pres = await _run_with_transient_retry(
+            slides_service.presentations().get(presentationId=presentation_id).execute,
+            label="slides.presentations.get (placeholder verification)",
+        )
+        existing_ids = _collect_existing_object_ids(verify_pres)
+        # Also remember the actual placeholders per slide so we can suggest a
+        # remediation in the warning (which type/index DID materialize).
+        verify_slide_placeholders: Dict[str, List[Dict[str, Any]]] = {}
+        for page in verify_pres.get("slides", []) or []:
+            page_id = page.get("objectId")
+            if not page_id:
+                continue
+            phs: List[Dict[str, Any]] = []
+            for el in page.get("pageElements", []) or []:
+                placeholder = (el.get("shape") or {}).get("placeholder") or {}
+                if not placeholder:
+                    continue
+                phs.append(
+                    {
+                        "type": placeholder.get("type"),
+                        "index": placeholder.get("index", 0),
+                        "objectId": el.get("objectId"),
+                    }
+                )
+            verify_slide_placeholders[page_id] = phs
+
+        filtered_per_slide_content: List[Tuple[int, List[Dict[str, Any]]]] = []
+        dropped_total = 0
+        for slide_idx, reqs in per_slide_content:
+            kept: List[Dict[str, Any]] = []
+            slide_id_for_log = slide_id_index_pairs[slide_idx][0] if slide_idx < len(
+                slide_id_index_pairs
+            ) else None
+            for req in reqs:
+                target_id = _extract_target_object_id(req)
+                if target_id and target_id not in existing_ids:
+                    dropped_total += 1
+                    actual_phs = verify_slide_placeholders.get(slide_id_for_log, [])
+                    logger.warning(
+                        f"[create_audit_presentation] Slide #{slide_idx + 1}: dropping "
+                        f"{next(iter(req.keys()))} request — target objectId "
+                        f"'{target_id}' did not materialize on the slide. The custom "
+                        f"layout silently dropped its placeholderIdMapping (likely a "
+                        f"type/index mismatch with the layout's real placeholders). "
+                        f"Slide actually exposes: "
+                        f"{json.dumps(actual_phs, ensure_ascii=False)}"
+                    )
+                    continue
+                kept.append(req)
+            filtered_per_slide_content.append((slide_idx, kept))
+        if dropped_total:
+            logger.warning(
+                f"[create_audit_presentation] Verification pass dropped {dropped_total} "
+                f"orphan content request(s). The deck will still be generated, but the "
+                f"affected fields will be empty. Open the layout(s) cited above in the "
+                f"Slides editor and add the missing placeholders to fix permanently."
+            )
+        per_slide_content = filtered_per_slide_content
+
         # Phase B: fill every slide's content. Requests are grouped PER SLIDE
         # so a single batchUpdate never spans multiple slides — this is what
         # eliminates the residual HTTP 500s on heterogeneous content batches
@@ -1096,12 +1253,30 @@ async def create_audit_presentation(
             data_sheet_meta = None
 
     except Exception:
-        # Best-effort rollback.
-        await _delete_file_safe(drive_service, presentation_id, "partial deck")
-        if data_sheet_meta:
-            await _delete_file_safe(
-                drive_service, data_sheet_meta.get("spreadsheet_id"), "partial data sheet"
+        if keep_on_error:
+            # Debug mode: leave the partial files in Drive so the user can
+            # inspect exactly which slides / placeholders / objects made it.
+            # The IDs are logged loudly so they're easy to grep for.
+            logger.warning(
+                f"[create_audit_presentation] keep_on_error=True — leaving partial "
+                f"deck on Drive for debugging: presentation_id={presentation_id} "
+                f"https://docs.google.com/presentation/d/{presentation_id}/edit"
             )
+            if data_sheet_meta and data_sheet_meta.get("spreadsheet_id"):
+                logger.warning(
+                    f"[create_audit_presentation] keep_on_error=True — leaving partial "
+                    f"data sheet on Drive: spreadsheet_id="
+                    f"{data_sheet_meta.get('spreadsheet_id')} "
+                    f"https://docs.google.com/spreadsheets/d/"
+                    f"{data_sheet_meta.get('spreadsheet_id')}/edit"
+                )
+        else:
+            # Best-effort rollback.
+            await _delete_file_safe(drive_service, presentation_id, "partial deck")
+            if data_sheet_meta:
+                await _delete_file_safe(
+                    drive_service, data_sheet_meta.get("spreadsheet_id"), "partial data sheet"
+                )
         raise
 
     message_parts = [
