@@ -46,7 +46,14 @@ MAX_REQUESTS_PER_BATCH = 10
 # Per-call addChart batches stay comfortably under Sheets quota.
 MAX_CHARTS_PER_SHEETS_BATCH = 20
 # Inter-batch pause to avoid bursting Slides/Sheets quota over many chunks.
-INTER_BATCH_SLEEP_S = 0.15
+# Google enforces "Write requests per minute per user" = 60 (default) on
+# slides.googleapis.com. With Phase A (1 batchUpdate per slide) + Phase B
+# (≥1 batchUpdate per slide) a 33-slide deck issues 66+ write requests; if we
+# fire them back-to-back the second half hits HTTP 429. Pacing at ~1s between
+# batches keeps a steady cadence comfortably under the per-minute limit on
+# typical decks. Larger decks may still hit the cap; raising the per-user
+# Slides quota is the proper fix for >60-slide builds.
+INTER_BATCH_SLEEP_S = 1.0
 # Per-batch retry policy. Total worst-case wait per batch ≈ 1+2+4+8+16+32 = 63s.
 # Transient Slides 500s nearly always clear within this window.
 BATCH_MAX_ATTEMPTS = 6
@@ -138,7 +145,17 @@ async def _run_with_transient_retry(
             last_error = err
             if attempt >= max_attempts - 1:
                 break
-            delay = base_delay * (2 ** attempt)
+            # 429 is rate-limit (per-minute quota), not flaky 5xx. Exponential
+            # 1-2-4-8s backoff doesn't actually clear the per-minute window —
+            # we need to wait long enough for the rolling minute to refresh.
+            # Use a much larger base for 429.
+            if status == 429:
+                # 5s, 10s, 20s, 40s, 80s, 160s — first retry alone covers most
+                # bursts; later retries cover sustained pressure.
+                effective_base = max(base_delay, 5.0)
+            else:
+                effective_base = base_delay
+            delay = effective_base * (2 ** attempt)
             logger.warning(
                 f"[create_audit_presentation:{label}] Transient HTTP {status} on "
                 f"attempt {attempt + 1}/{max_attempts}. Retrying in {delay:.1f}s..."
@@ -569,6 +586,34 @@ def _extract_target_object_id(request: Dict[str, Any]) -> Optional[str]:
         if kind in request:
             return (request[kind] or {}).get(field)
     return None
+
+
+def _rebind_request_object_id(
+    request: Dict[str, Any], rebind_map: Dict[str, str]
+) -> Dict[str, Any]:
+    """Rewrite the `objectId` (or `imageObjectId`) field of a Slides request
+    using `rebind_map` if its current value is a pseudo objectId we deferred.
+
+    Returns a NEW request dict if rewriting happened, or the original request
+    untouched. Does not mutate input.
+
+    Only the top-level `objectId` of object-referencing requests is rewritten:
+    `insertText`, `updateTextStyle`, `updateParagraphStyle`,
+    `updateShapeProperties`, `updatePageElementTransform`, `replaceImage`,
+    `deleteObject`. Create-new requests (createTable, createShape, etc.)
+    keep their newly-minted IDs untouched.
+    """
+    for kind, field in _OBJECT_REFERENCING_REQUEST_FIELDS.items():
+        if kind not in request:
+            continue
+        inner = request[kind] or {}
+        old_id = inner.get(field)
+        if old_id and old_id in rebind_map:
+            new_inner = dict(inner)
+            new_inner[field] = rebind_map[old_id]
+            return {kind: new_inner}
+        return request
+    return request
 
 
 def _extract_created_object_id(request: Dict[str, Any]) -> Optional[str]:
@@ -1171,15 +1216,28 @@ async def create_audit_presentation(
         # same batch reliably triggers HTTP 500s against custom layouts.
         per_slide_content: List[Tuple[int, List[Dict[str, Any]]]] = []
         slide_id_index_pairs: List[Tuple[str, int]] = []
+        # Aggregated pseudo-objectId → (slide_id, ph_type, layout_index) map.
+        # Resolved post-Phase-A by reading the live deck and replacing pseudo
+        # IDs in every content request with the real auto-assigned objectId.
+        # This is the workaround for the Slides multi-same-type-placeholder
+        # binding bug (see build_slide_with_placeholders docstring).
+        all_deferred_lookups: Dict[str, Tuple[str, str, int]] = {}
 
         for index, slide_spec in enumerate(slides):
-            slide_id, slide_creation, slide_content, slide_placeholders = B.build_slide_with_placeholders(
+            (
+                slide_id,
+                slide_creation,
+                slide_content,
+                slide_placeholders,
+                slide_deferred_lookups,
+            ) = B.build_slide_with_placeholders(
                 presentation=presentation,
                 slide_spec=slide_spec,
                 insertion_index=slide_offset + index,
             )
             slide_id_index_pairs.append((slide_id, index))
             creation_requests.extend(slide_creation)
+            all_deferred_lookups.update(slide_deferred_lookups)
 
             this_slide_content: List[Dict[str, Any]] = list(slide_content)
 
@@ -1282,6 +1340,55 @@ async def create_audit_presentation(
                     }
                 )
             verify_slide_placeholders[page_id] = phs
+
+        # Resolve deferred placeholder lookups (multi-same-type bindings).
+        # For Two Columns and other custom layouts with 2+ placeholders of
+        # the same type, we deliberately did NOT use placeholderIdMappings
+        # at createSlide time (it triggers a Slides backend bug where the
+        # second+ binding is a "ghost" — objectId visible in pageElements
+        # but underlying shape unwired, causing HTTP 500 on insertText).
+        # Now that the slides exist with auto-assigned IDs, we look up the
+        # real objectId for each (slide_id, ph_type, layout_index) we
+        # registered in `all_deferred_lookups` and rewrite every content
+        # request that targets the corresponding pseudo objectId.
+        rebind_map: Dict[str, str] = {}
+        unresolved_lookups: List[str] = []
+        for pseudo_id, (slide_id_for_lookup, ph_type, layout_index) in all_deferred_lookups.items():
+            phs = verify_slide_placeholders.get(slide_id_for_lookup, [])
+            real_id: Optional[str] = None
+            for ph in phs:
+                if ph.get("type") == ph_type and ph.get("index", 0) == layout_index:
+                    real_id = ph.get("objectId")
+                    break
+            if real_id:
+                rebind_map[pseudo_id] = real_id
+            else:
+                unresolved_lookups.append(
+                    f"{pseudo_id}->({ph_type},index={layout_index},slide={slide_id_for_lookup})"
+                )
+
+        if unresolved_lookups:
+            logger.warning(
+                f"[create_audit_presentation] {len(unresolved_lookups)} deferred "
+                f"placeholder lookup(s) could not be resolved on the live deck "
+                f"(layout placeholder did not materialize as expected): "
+                f"{unresolved_lookups[:5]}{' ...' if len(unresolved_lookups) > 5 else ''}. "
+                f"Their content requests will be dropped by the orphan filter."
+            )
+
+        if rebind_map:
+            logger.info(
+                f"[create_audit_presentation] Rebinding {len(rebind_map)} deferred "
+                f"placeholder ID(s) to their real auto-assigned objectIds (workaround "
+                f"for Slides multi-same-type-placeholder ghost-binding bug)."
+            )
+            rewritten_per_slide_content: List[Tuple[int, List[Dict[str, Any]]]] = []
+            for slide_idx, reqs in per_slide_content:
+                rewritten_reqs: List[Dict[str, Any]] = []
+                for req in reqs:
+                    rewritten_reqs.append(_rebind_request_object_id(req, rebind_map))
+                rewritten_per_slide_content.append((slide_idx, rewritten_reqs))
+            per_slide_content = rewritten_per_slide_content
 
         filtered_per_slide_content: List[Tuple[int, List[Dict[str, Any]]]] = []
         dropped_total = 0

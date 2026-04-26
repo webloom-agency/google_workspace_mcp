@@ -457,7 +457,13 @@ def build_slide_with_placeholders(
     presentation: Dict[str, Any],
     slide_spec: Dict[str, Any],
     insertion_index: Optional[int] = None,
-) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, str]]:
+) -> Tuple[
+    str,
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    Dict[str, str],
+    Dict[str, Tuple[str, str, int]],
+]:
     """Build the createSlide + placeholder text-fill + extra-element requests for ONE slide.
 
     The returned requests are split into two phases so the caller can run *every*
@@ -468,15 +474,34 @@ def build_slide_with_placeholders(
     and stacking many of those next to dependent inserts in one batch is fragile).
 
     Returns:
-        (slide_id, creation_requests, content_requests, placeholder_ids)
+        (slide_id, creation_requests, content_requests, placeholder_ids,
+         deferred_placeholder_lookups)
         - creation_requests: the single `createSlide` request for this slide.
         - content_requests: insertText, updateTextStyle, createTable (+ cell
           inserts), createShape (text boxes), createImage, replaceImage. Every
-          one of these references either the slide itself or a placeholder
-          objectId we pre-allocated, so they only need the createSlide phase
-          to be committed first.
+          one of these references either the slide itself, a placeholder
+          objectId we pre-allocated via `placeholderIdMappings`, or a *pseudo*
+          objectId scheduled for post-Phase-A rebinding (see below).
         - placeholder_ids: maps semantic names ("title", "subtitle", "body[i]",
-          "image[i]") to the objectIds we assigned via `placeholderIdMappings`.
+          "image[i]") to the objectIds (real or pseudo) used by the requests
+          targeting that placeholder.
+        - deferred_placeholder_lookups: maps pseudo objectIds → (slide_id,
+          placeholder_type, layout_index). The caller MUST resolve these to
+          the actual auto-assigned objectIds (by reading the live deck after
+          Phase A) and rewrite every content_request targeting them.
+
+    Why deferred lookups exist:
+        For custom layouts with MULTIPLE placeholders of the same type
+        (e.g. two BODY placeholders in a "Two Columns" layout), the Slides
+        backend has a known pathology: when `placeholderIdMappings` binds
+        2+ same-type placeholders, the second+ binding ends up as a "ghost"
+        — its objectId appears in the slide's pageElements (so verification
+        passes) but the underlying shape isn't fully wired, so any operation
+        on it returns a generic HTTP 500 ('Internal error encountered').
+        For these cases we deliberately DO NOT include the placeholder in
+        `placeholderIdMappings`; we let Slides auto-assign the objectId,
+        then resolve our pseudo objectId to the real one after Phase A and
+        rewrite the dependent content requests. This bypasses the bug.
     """
     slide_id = gen_id("sl")
     layout_name = slide_spec.get("layout") or "BLANK"
@@ -493,6 +518,16 @@ def build_slide_with_placeholders(
         layout_placeholders_by_type = get_layout_placeholders_by_type(
             presentation, layout_ref["layoutId"]
         )
+
+    def _is_multi_occurrence(ph_type: str) -> bool:
+        """A custom layout has 2+ placeholders of `ph_type`?
+
+        Predefined layouts never trigger the multi-mapping bug, so we only
+        defer for custom layouts (`layoutId` is set).
+        """
+        if "layoutId" not in layout_ref:
+            return False
+        return len(layout_placeholders_by_type.get(ph_type) or []) > 1
 
     def _build_layout_placeholder_mapping(
         ph_type: str, occurrence: int = 0
@@ -527,6 +562,42 @@ def build_slide_with_placeholders(
     placeholder_ids: Dict[str, str] = {}
     placeholder_mappings: List[Dict[str, Any]] = []
     skipped_fields: List[str] = []
+    # pseudo_id -> (slide_id, placeholder_type, layout_index_to_match)
+    deferred_lookups: Dict[str, Tuple[str, str, int]] = {}
+
+    def _allocate_placeholder(
+        ph_type: str, occurrence: int, semantic_name: str
+    ) -> Optional[str]:
+        """Allocate either a pre-bound or deferred objectId for one placeholder.
+
+        Returns the objectId to use in dependent requests, or None if the layout
+        has no matching placeholder for (ph_type, occurrence).
+
+        Strategy:
+          * Singleton custom-layout placeholders (only one of `ph_type` in the
+            layout) and predefined-layout placeholders → pre-bind via
+            `placeholderIdMappings`. This works reliably.
+          * Multi-occurrence custom-layout placeholders (BODY[0] AND BODY[1]
+            in Two Columns, etc.) → emit a pseudo objectId now and defer real
+            ID resolution until after Phase A. Avoids the multi-mapping ghost
+            bug.
+        """
+        indexes = layout_placeholders_by_type.get(ph_type) or []
+        if "layoutId" in layout_ref and occurrence >= len(indexes):
+            return None
+        ph_id = gen_id("ph")
+        placeholder_ids[semantic_name] = ph_id
+        if _is_multi_occurrence(ph_type):
+            layout_index = indexes[occurrence]
+            deferred_lookups[ph_id] = (slide_id, ph_type, layout_index)
+            return ph_id
+        # Singleton or predefined: traditional pre-binding works fine.
+        mapping = _build_layout_placeholder_mapping(ph_type, occurrence=occurrence)
+        if mapping is None:
+            placeholder_ids.pop(semantic_name, None)
+            return None
+        placeholder_mappings.append({"layoutPlaceholder": mapping, "objectId": ph_id})
+        return ph_id
 
     simple_text_fields = {
         "title": "TITLE",
@@ -535,15 +606,9 @@ def build_slide_with_placeholders(
     }
     for field_name, ph_type in simple_text_fields.items():
         if field_name in fields and fields[field_name]:
-            placeholder_obj = _build_layout_placeholder_mapping(ph_type, occurrence=0)
-            if placeholder_obj is None:
+            allocated = _allocate_placeholder(ph_type, 0, field_name)
+            if allocated is None:
                 skipped_fields.append(f"{field_name} ({ph_type})")
-                continue
-            ph_id = gen_id("ph")
-            placeholder_ids[field_name] = ph_id
-            placeholder_mappings.append(
-                {"layoutPlaceholder": placeholder_obj, "objectId": ph_id}
-            )
 
     body_value = fields.get("body")
     body_texts: List[str] = []
@@ -554,15 +619,9 @@ def build_slide_with_placeholders(
     for i, body_text in enumerate(body_texts):
         if not body_text:
             continue
-        placeholder_obj = _build_layout_placeholder_mapping("BODY", occurrence=i)
-        if placeholder_obj is None:
+        allocated = _allocate_placeholder("BODY", i, f"body[{i}]")
+        if allocated is None:
             skipped_fields.append(f"body[{i}] (BODY)")
-            continue
-        ph_id = gen_id("ph")
-        placeholder_ids[f"body[{i}]"] = ph_id
-        placeholder_mappings.append(
-            {"layoutPlaceholder": placeholder_obj, "objectId": ph_id}
-        )
 
     image_placeholder_specs = slide_spec.get("image_placeholders") or []
     image_fill: List[Tuple[str, Dict[str, Any]]] = []
@@ -575,16 +634,11 @@ def build_slide_with_placeholders(
             continue
         if not spec.get("url"):
             continue
-        placeholder_obj = _build_layout_placeholder_mapping("PICTURE", occurrence=i)
-        if placeholder_obj is None:
+        allocated = _allocate_placeholder("PICTURE", i, f"image[{i}]")
+        if allocated is None:
             skipped_fields.append(f"image[{i}] (PICTURE)")
             continue
-        ph_id = gen_id("ph")
-        placeholder_ids[f"image[{i}]"] = ph_id
-        placeholder_mappings.append(
-            {"layoutPlaceholder": placeholder_obj, "objectId": ph_id}
-        )
-        image_fill.append((ph_id, spec))
+        image_fill.append((allocated, spec))
 
     if skipped_fields:
         # Surface this as part of the returned placeholder_ids so the caller can
@@ -674,4 +728,4 @@ def build_slide_with_placeholders(
             )
             content_requests.extend(tb_requests)
 
-    return slide_id, creation_requests, content_requests, placeholder_ids
+    return slide_id, creation_requests, content_requests, placeholder_ids, deferred_lookups
