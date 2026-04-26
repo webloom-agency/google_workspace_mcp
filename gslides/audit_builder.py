@@ -1538,7 +1538,29 @@ async def create_audit_presentation(
                         "skipping notes."
                     )
                     continue
-                notes_requests.extend(B.build_speaker_notes_requests(speaker_notes_id, notes_text))
+                # Extract whatever text the notes shape currently holds so we can
+                # decide whether a `deleteText` request is needed. On freshly-
+                # created slides this is always empty; calling deleteText with
+                # `textRange: {type: "ALL"}` on an empty shape triggers
+                # "HTTP 400: The startIndex 0 must be less than the endIndex 0".
+                existing_notes_text = ""
+                for el in notes_page.get("pageElements") or []:
+                    if el.get("objectId") != speaker_notes_id:
+                        continue
+                    text_block = (el.get("shape") or {}).get("text") or {}
+                    parts: List[str] = []
+                    for te in text_block.get("textElements", []) or []:
+                        tr = te.get("textRun") or {}
+                        content = tr.get("content")
+                        if content:
+                            parts.append(content)
+                    existing_notes_text = "".join(parts)
+                    break
+                notes_requests.extend(
+                    B.build_speaker_notes_requests(
+                        speaker_notes_id, notes_text, existing_notes_text
+                    )
+                )
             await _execute_slides_batches(slides_service, presentation_id, notes_requests)
 
         # 9) Optional cleanup of data sheet.

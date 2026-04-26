@@ -581,26 +581,47 @@ def build_sheets_chart_requests(
 
 
 def build_speaker_notes_requests(
-    speaker_notes_object_id: str, notes_text: str
+    speaker_notes_object_id: str,
+    notes_text: str,
+    existing_notes_text: str = "",
 ) -> List[Dict[str, Any]]:
-    """Replace any existing speaker notes text on the notes shape, then insert the new text."""
+    """Set speaker notes on the notes shape, replacing any existing text.
+
+    Crucially: only emits a `deleteText` request if `existing_notes_text` is
+    non-empty. The Slides API rejects `deleteText` with
+    `textRange: {type: "ALL"}` on an empty shape because it internally
+    resolves `ALL` to `(startIndex: 0, endIndex: 0)` and then enforces
+    `endIndex > startIndex` ("HTTP 400: The startIndex 0 must be less
+    than the endIndex 0"). For freshly-created slides the notes shape is
+    always empty, so the delete must be skipped.
+
+    Pass `existing_notes_text=""` (the default) when you know the notes
+    shape was just created. Pass the live text otherwise — the caller can
+    extract it from the slide's `notesPage.pageElements[].shape.text` in
+    the same `presentations.get` it used to find `speakerNotesObjectId`.
+    """
     if not notes_text:
         return []
-    return [
-        {
-            "deleteText": {
-                "objectId": speaker_notes_object_id,
-                "textRange": {"type": "ALL"},
+    requests: List[Dict[str, Any]] = []
+    if existing_notes_text:
+        requests.append(
+            {
+                "deleteText": {
+                    "objectId": speaker_notes_object_id,
+                    "textRange": {"type": "ALL"},
+                }
             }
-        },
+        )
+    requests.append(
         {
             "insertText": {
                 "objectId": speaker_notes_object_id,
                 "insertionIndex": 0,
                 "text": notes_text,
             }
-        },
-    ]
+        }
+    )
+    return requests
 
 
 def chunk_requests(
