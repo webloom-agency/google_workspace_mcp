@@ -520,6 +520,40 @@ async def _execute_slides_batches(
             await asyncio.sleep(INTER_BATCH_SLEEP_S)
 
 
+async def _execute_slides_sequentially(
+    slides_service,
+    presentation_id: str,
+    requests: List[Dict[str, Any]],
+    label_prefix: str,
+) -> None:
+    """Run each Slides request as its own `batchUpdate` call.
+
+    This is the bulletproof path for `createSlide` requests that target custom
+    or custom-derived layouts (e.g. layouts whose internal `name` is something
+    like `TITLE_AND_BODY_1_2`). The Slides backend reliably 500s
+    ('Internal error encountered') when several such `createSlide` calls share
+    a single `batchUpdate`, even when the requests themselves are individually
+    valid and even at a batch size as small as 30. Sending them one by one
+    sidesteps that class of issue entirely while keeping the per-call retry
+    layer for genuine transient errors.
+
+    Each call still uses `_run_with_transient_retry`, so transient 5xx/429 on
+    a single create get absorbed locally without restarting the build.
+    """
+    if not requests:
+        return
+    total = len(requests)
+    for i, req in enumerate(requests):
+        await _run_with_transient_retry(
+            slides_service.presentations()
+            .batchUpdate(presentationId=presentation_id, body={"requests": [req]})
+            .execute,
+            label=f"{label_prefix} {i + 1}/{total}",
+        )
+        if i < total - 1:
+            await asyncio.sleep(INTER_BATCH_SLEEP_S)
+
+
 def _annotate_chart_uids(deck: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Walk the deck, assign a unique _uid to every chart spec, and return the flat chart list."""
     flat: List[Dict[str, Any]] = []
@@ -941,11 +975,22 @@ async def create_audit_presentation(
                     )
                 )
 
-        # Phase A: create all slides first.
-        await _execute_slides_batches(slides_service, presentation_id, creation_requests)
+        # Phase A: create all slides first, ONE PER CALL. Slides batchUpdate
+        # is unreliable when several `createSlide` requests targeting custom
+        # or derived layouts ride in the same batch — Google returns generic
+        # HTTP 500s ('Internal error encountered') even at small batch sizes.
+        # Sequential creation is slower (~250-500ms per slide) but rock-solid
+        # and lets each individual create get its own retry budget.
+        await _execute_slides_sequentially(
+            slides_service,
+            presentation_id,
+            creation_requests,
+            label_prefix="slides.createSlide",
+        )
         # Phase B: fill every slide's content. By now every slide and every
         # placeholder objectId we pre-allocated is fully committed, so these
-        # inserts/updates can never race a dependency.
+        # inserts/updates can never race a dependency, and they're tolerant
+        # of normal batching.
         await _execute_slides_batches(slides_service, presentation_id, content_requests)
 
         # 8) Speaker notes pass: re-fetch to find each slide's speakerNotesObjectId, then insert.
