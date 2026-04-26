@@ -49,6 +49,22 @@ def gen_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+def _normalize_layout_name(name: str) -> str:
+    """Lowercase + collapse internal whitespace so 'Title  +  Body' matches 'title + body'."""
+    return " ".join(str(name).strip().lower().split())
+
+
+def _list_template_layouts(presentation: Dict[str, Any]) -> List[str]:
+    """Return display names of every custom layout in the copied template."""
+    names: List[str] = []
+    for layout in presentation.get("layouts", []) or []:
+        props = layout.get("layoutProperties", {}) or {}
+        name = props.get("displayName") or props.get("name")
+        if name:
+            names.append(name)
+    return names
+
+
 def resolve_layout_reference(
     presentation: Dict[str, Any], layout_name: str
 ) -> Dict[str, Any]:
@@ -57,23 +73,48 @@ def resolve_layout_reference(
     Resolution order:
       1. Predefined layout name (e.g. "TITLE_AND_BODY") -> {predefinedLayout: ...}
       2. Custom layout DISPLAY name found in the template's masters -> {layoutId: ...}
-      3. Falls back to BLANK if nothing matches.
+         Match is case-insensitive and whitespace-normalized so 'Title + Body',
+         'title  +  body', and 'TITLE + BODY' all resolve identically.
+      3. Raises a clear Exception listing every available custom layout. We do
+         NOT fall back to predefined BLANK here because most user templates
+         ship a custom master that doesn't include the BLANK predefined layout
+         (Google then 400s with 'predefined layout (BLANK) is not present in
+         the current master'), which masks the real misconfiguration.
     """
     if not layout_name:
-        return {"predefinedLayout": "BLANK"}
+        raise Exception(
+            "Slide is missing 'layout'. Set it to a predefined name "
+            "(e.g. 'TITLE_AND_BODY', 'SECTION_HEADER') or to the exact display "
+            "name of a custom layout in your template."
+        )
 
+    # Predefined layout (or one of its friendly aliases).
     canonical = LAYOUT_ALIASES.get(layout_name.lower(), layout_name)
-
     if canonical in PREDEFINED_LAYOUTS:
         return {"predefinedLayout": canonical}
 
+    # Custom layout — match by normalized display name.
+    target = _normalize_layout_name(layout_name)
+    canonical_target = _normalize_layout_name(canonical)
     for layout in presentation.get("layouts", []) or []:
         props = layout.get("layoutProperties", {}) or {}
         display_name = props.get("displayName") or props.get("name")
-        if display_name == layout_name or display_name == canonical:
+        if not display_name:
+            continue
+        if _normalize_layout_name(display_name) in (target, canonical_target):
             return {"layoutId": layout["objectId"]}
 
-    return {"predefinedLayout": "BLANK"}
+    # No match — surface the real problem instead of silently picking BLANK.
+    available = _list_template_layouts(presentation)
+    available_str = ", ".join(repr(n) for n in available) if available else "(none found)"
+    raise Exception(
+        f"Layout '{layout_name}' was not found in the template. "
+        f"Available custom layouts in this template: {available_str}. "
+        f"Predefined layouts you can also use: {sorted(PREDEFINED_LAYOUTS)}. "
+        f"Either rename the slide's 'layout' to match one of the above exactly "
+        f"(matching is case-insensitive and ignores extra spaces), or add a "
+        f"custom layout with that display name to your template."
+    )
 
 
 def _pt(value: float) -> Dict[str, Any]:

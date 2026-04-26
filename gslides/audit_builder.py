@@ -657,6 +657,71 @@ async def create_audit_presentation(
         f"{template_presentation_id}, Deck title: '{deck_title}', Slides: {len(slides)}"
     )
 
+    # 0) Pre-flight: read the TEMPLATE's layouts directly and validate every
+    # slide's `layout` against them before copying anything. This way a typo
+    # like 'Title + Chart + Body' (when the template only has 'Title + Chart')
+    # fails immediately with a clear error listing the available layouts —
+    # without leaving an orphan copy in Drive.
+    template_meta = await _run_with_transient_retry(
+        slides_service.presentations().get(presentationId=template_presentation_id).execute,
+        label="slides.presentations.get (template preflight)",
+    )
+
+    # Trace EVERY custom layout the Slides API exposes for this template,
+    # along with which master each one belongs to. This is the single most
+    # useful diagnostic when Google complains 'predefined layout (X) is not
+    # present in the current master': the log will show exactly what was
+    # actually copied vs. what the editor UI shows. Use repr() to surface any
+    # invisible Unicode (NBSPs, zero-width spaces, etc.) drifting into a
+    # layout name.
+    template_masters = [
+        {"objectId": m.get("objectId"), "displayName": (m.get("masterProperties") or {}).get("displayName")}
+        for m in (template_meta.get("masters") or [])
+    ]
+    template_layouts_trace = []
+    for layout in template_meta.get("layouts") or []:
+        props = layout.get("layoutProperties") or {}
+        template_layouts_trace.append(
+            {
+                "objectId": layout.get("objectId"),
+                "displayName": props.get("displayName"),
+                "name": props.get("name"),
+                "masterObjectId": props.get("masterObjectId"),
+            }
+        )
+    logger.info(
+        f"[create_audit_presentation] Template preflight: "
+        f"{len(template_masters)} master(s), {len(template_layouts_trace)} layout(s)."
+    )
+    logger.info(
+        f"[create_audit_presentation] Template masters: "
+        f"{json.dumps(template_masters, ensure_ascii=False)}"
+    )
+    logger.info(
+        f"[create_audit_presentation] Template layouts (use repr() output to spot hidden "
+        f"Unicode in displayName): "
+        f"{json.dumps(template_layouts_trace, ensure_ascii=False)}"
+    )
+    # Also log the EXACT slide layout names from the deck JSON for side-by-side
+    # comparison with the template_layouts_trace dump above.
+    requested_layouts = sorted({(s.get("layout") or "BLANK") for s in slides})
+    logger.info(
+        f"[create_audit_presentation] Deck requests {len(requested_layouts)} distinct layout "
+        f"name(s): {json.dumps(requested_layouts, ensure_ascii=False)}"
+    )
+
+    layout_errors: List[str] = []
+    for i, slide_spec in enumerate(slides):
+        try:
+            B.resolve_layout_reference(template_meta, slide_spec.get("layout") or "BLANK")
+        except Exception as resolve_err:
+            layout_errors.append(f"  • Slide #{i + 1}: {resolve_err}")
+    if layout_errors:
+        raise Exception(
+            "Layout validation failed before any Drive operation:\n"
+            + "\n".join(layout_errors)
+        )
+
     # 1) Resolve target folder (if any) BEFORE the copy so we can do `if_exists` checks.
     target_folder_id = folder_id
     folder_path_summary = ""
@@ -756,6 +821,73 @@ async def create_audit_presentation(
             slides_service.presentations().get(presentationId=presentation_id).execute,
             label="slides.presentations.get (layout discovery)",
         )
+
+        # Trace the COPIED presentation's masters and layouts. If this differs
+        # from the template preflight log above, we know `drive.files.copy`
+        # didn't preserve everything (rare but possible with PPTX-imported
+        # templates) and the user can act on it directly.
+        copy_masters = [
+            {"objectId": m.get("objectId"),
+             "displayName": (m.get("masterProperties") or {}).get("displayName")}
+            for m in (presentation.get("masters") or [])
+        ]
+        copy_layouts_trace = []
+        for layout in presentation.get("layouts") or []:
+            props = layout.get("layoutProperties") or {}
+            copy_layouts_trace.append(
+                {
+                    "objectId": layout.get("objectId"),
+                    "displayName": props.get("displayName"),
+                    "name": props.get("name"),
+                    "masterObjectId": props.get("masterObjectId"),
+                }
+            )
+        logger.info(
+            f"[create_audit_presentation] Copy state after strip: "
+            f"{len(copy_masters)} master(s), {len(copy_layouts_trace)} layout(s)."
+        )
+        logger.info(
+            f"[create_audit_presentation] Copy masters: "
+            f"{json.dumps(copy_masters, ensure_ascii=False)}"
+        )
+        logger.info(
+            f"[create_audit_presentation] Copy layouts: "
+            f"{json.dumps(copy_layouts_trace, ensure_ascii=False)}"
+        )
+
+        # Re-resolve every slide's layout against the COPY (not the template)
+        # and log the resolution path. If anything resolves to predefinedLayout
+        # while we expected a custom layout, we'll see it immediately.
+        for index, slide_spec in enumerate(slides):
+            requested = slide_spec.get("layout") or "BLANK"
+            try:
+                ref = B.resolve_layout_reference(presentation, requested)
+                if "layoutId" in ref:
+                    matched = next(
+                        (
+                            f"{l['displayName']!r} ({l['objectId']})"
+                            for l in copy_layouts_trace
+                            if l["objectId"] == ref["layoutId"]
+                        ),
+                        ref["layoutId"],
+                    )
+                    logger.info(
+                        f"[create_audit_presentation] Slide #{index + 1} layout='{requested}' "
+                        f"-> custom layoutId={matched}"
+                    )
+                else:
+                    logger.info(
+                        f"[create_audit_presentation] Slide #{index + 1} layout='{requested}' "
+                        f"-> predefinedLayout={ref.get('predefinedLayout')}"
+                    )
+            except Exception as resolve_err:
+                # Preflight already validated against the template, so this would
+                # only fire if the COPY lost something. Log loudly; the build
+                # below will then re-raise via the same resolver call.
+                logger.error(
+                    f"[create_audit_presentation] Slide #{index + 1} layout='{requested}' "
+                    f"FAILED to resolve against the copied presentation: {resolve_err}"
+                )
 
         # When keeping template slides, append generated slides at the end so the boilerplate
         # (cover, methodology, ...) stays in front. Otherwise the template is already empty.
