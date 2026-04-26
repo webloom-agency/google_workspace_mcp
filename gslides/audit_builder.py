@@ -47,13 +47,14 @@ MAX_REQUESTS_PER_BATCH = 10
 MAX_CHARTS_PER_SHEETS_BATCH = 20
 # Inter-batch pause to avoid bursting Slides/Sheets quota over many chunks.
 # Google enforces "Write requests per minute per user" = 60 (default) on
-# slides.googleapis.com. With Phase A (1 batchUpdate per slide) + Phase B
-# (≥1 batchUpdate per slide) a 33-slide deck issues 66+ write requests; if we
-# fire them back-to-back the second half hits HTTP 429. Pacing at ~1s between
-# batches keeps a steady cadence comfortably under the per-minute limit on
-# typical decks. Larger decks may still hit the cap; raising the per-user
-# Slides quota is the proper fix for >60-slide builds.
-INTER_BATCH_SLEEP_S = 1.0
+# slides.googleapis.com. A typical 33-slide deck issues ~66 writes (one
+# createSlide per slide in Phase A, one batchUpdate per slide in Phase B).
+# 0.3s pacing → ~66 writes spread over ~52s end-to-end, averaging well
+# below the per-minute cap. If we hit it on the very last writes, the
+# smart 429 backoff in `_run_with_transient_retry` (5s base, exponential)
+# absorbs it cleanly. Larger decks (>60 slides) may still need a quota
+# bump from Google Cloud Console; pacing alone can't widen the ceiling.
+INTER_BATCH_SLEEP_S = 0.3
 # Per-batch retry policy. Total worst-case wait per batch ≈ 1+2+4+8+16+32 = 63s.
 # Transient Slides 500s nearly always clear within this window.
 BATCH_MAX_ATTEMPTS = 6
