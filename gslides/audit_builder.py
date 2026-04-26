@@ -981,6 +981,13 @@ async def create_audit_presentation(
         # HTTP 500s ('Internal error encountered') even at small batch sizes.
         # Sequential creation is slower (~250-500ms per slide) but rock-solid
         # and lets each individual create get its own retry budget.
+        # Distinctive marker so logs make it obvious which code path is live —
+        # if you don't see this line in the server logs, your runtime is on a
+        # stale build that still does batched createSlide.
+        logger.info(
+            f"[create_audit_presentation] Phase A: creating {len(creation_requests)} "
+            f"slide(s) sequentially (one createSlide per batchUpdate call)."
+        )
         await _execute_slides_sequentially(
             slides_service,
             presentation_id,
@@ -991,6 +998,10 @@ async def create_audit_presentation(
         # placeholder objectId we pre-allocated is fully committed, so these
         # inserts/updates can never race a dependency, and they're tolerant
         # of normal batching.
+        logger.info(
+            f"[create_audit_presentation] Phase B: applying {len(content_requests)} "
+            f"content request(s) in batches of {MAX_REQUESTS_PER_BATCH}."
+        )
         await _execute_slides_batches(slides_service, presentation_id, content_requests)
 
         # 8) Speaker notes pass: re-fetch to find each slide's speakerNotesObjectId, then insert.
