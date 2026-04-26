@@ -104,6 +104,47 @@ def get_layout_placeholders_by_type(
     return out
 
 
+def get_layout_placeholder_geometry(
+    presentation: Dict[str, Any],
+    layout_object_id: str,
+    ph_type: str,
+    occurrence: int = 0,
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """Return (size, transform) of the `occurrence`-th `ph_type` placeholder
+    on the layout `layout_object_id`, in the exact format the Slides API
+    `Size` / `AffineTransform` use.
+
+    `occurrence` orders by ascending `placeholder.index` (so occurrence=0 is
+    the placeholder with the lowest index for that type — typically left or
+    top).
+
+    Returns None if the layout is not found or has no such placeholder.
+
+    This is used to overlay a free-floating TEXT_BOX on top of broken
+    multi-same-type placeholders (Slides API ghost-bug workaround).
+    """
+    for layout in presentation.get("layouts", []) or []:
+        if layout.get("objectId") != layout_object_id:
+            continue
+        candidates: List[Tuple[int, Dict[str, Any]]] = []
+        for element in layout.get("pageElements", []) or []:
+            shape = element.get("shape") or {}
+            placeholder = shape.get("placeholder")
+            if not placeholder or placeholder.get("type") != ph_type:
+                continue
+            candidates.append((int(placeholder.get("index", 0)), element))
+        candidates.sort(key=lambda t: t[0])
+        if occurrence >= len(candidates):
+            return None
+        _, el = candidates[occurrence]
+        size = el.get("size")
+        transform = el.get("transform")
+        if not size or not transform:
+            return None
+        return size, transform
+    return None
+
+
 def resolve_layout_reference(
     presentation: Dict[str, Any], layout_name: str
 ) -> Dict[str, Any]:
@@ -184,14 +225,72 @@ def _position(spec: Optional[Dict[str, Any]], default: Dict[str, float]) -> Dict
     return out
 
 
+def _utf16_len(s: str) -> int:
+    """Length of `s` in UTF-16 code units (matches Google Slides textRange indexing).
+
+    Emoji and other supplementary-plane chars contribute 2 units; BMP chars 1.
+    """
+    n = 0
+    for ch in s:
+        n += 2 if ord(ch) > 0xFFFF else 1
+    return n
+
+
+def _parse_inline_bold(text: str) -> Tuple[str, List[Tuple[int, int]]]:
+    """Strip `**bold**` markers from `text`, return the plain string and a list
+    of (start_utf16, end_utf16_exclusive) ranges that should be rendered bold.
+
+    Indexes are in UTF-16 code units (Google Slides indexing convention) so
+    emoji-heavy text bolds correctly.
+
+    Edge cases:
+      * Unmatched `**` (no closing pair) is left untouched.
+      * `\\**` is treated as a literal `**` (escape hatch).
+    """
+    out_chars: List[str] = []
+    bold_ranges: List[Tuple[int, int]] = []
+    cursor16 = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        if text.startswith("\\**", i):
+            out_chars.append("**")
+            cursor16 += 2
+            i += 3
+            continue
+        if text.startswith("**", i):
+            j = text.find("**", i + 2)
+            if j != -1:
+                inner = text[i + 2 : j]
+                inner_len16 = _utf16_len(inner)
+                if inner_len16 > 0:
+                    bold_ranges.append((cursor16, cursor16 + inner_len16))
+                out_chars.append(inner)
+                cursor16 += inner_len16
+                i = j + 2
+                continue
+        ch = text[i]
+        out_chars.append(ch)
+        cursor16 += 2 if ord(ch) > 0xFFFF else 1
+        i += 1
+    return "".join(out_chars), bold_ranges
+
+
 def build_text_insert_requests(
     object_id: str, text: str, style: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
-    """Insert text into a shape, optionally applying a text style to the whole inserted range."""
+    """Insert text into a shape, optionally applying a text style to the whole inserted range.
+
+    Inline `**bold**` markers in `text` are stripped and replaced with per-range
+    `updateTextStyle` requests that bold the wrapped span. Use `\\**` to insert
+    a literal pair of asterisks. Emojis are passed through as-is and correctly
+    accounted for in the UTF-16 indexing the Slides API expects.
+    """
     if not text:
         return []
+    plain, bold_ranges = _parse_inline_bold(text)
     requests: List[Dict[str, Any]] = [
-        {"insertText": {"objectId": object_id, "insertionIndex": 0, "text": text}}
+        {"insertText": {"objectId": object_id, "insertionIndex": 0, "text": plain}}
     ]
     if style:
         requests.append(
@@ -201,6 +300,23 @@ def build_text_insert_requests(
                     "textRange": {"type": "ALL"},
                     "style": style,
                     "fields": ",".join(style.keys()),
+                }
+            }
+        )
+    for start, end in bold_ranges:
+        if end <= start:
+            continue
+        requests.append(
+            {
+                "updateTextStyle": {
+                    "objectId": object_id,
+                    "textRange": {
+                        "type": "FIXED_RANGE",
+                        "startIndex": start,
+                        "endIndex": end,
+                    },
+                    "style": {"bold": True},
+                    "fields": "bold",
                 }
             }
         )
@@ -486,7 +602,9 @@ def build_slide_with_placeholders(
           "image[i]") to the objectIds (real or pseudo) used by the requests
           targeting that placeholder.
         - deferred_placeholder_lookups: maps pseudo objectIds → (slide_id,
-          placeholder_type, layout_index). The caller MUST resolve these to
+          placeholder_type, occurrence). `occurrence` is the 0-based ORDER of
+          this placeholder among same-type placeholders on the slide (matching
+          by ascending slide-level `index`). The caller MUST resolve these to
           the actual auto-assigned objectIds (by reading the live deck after
           Phase A) and rewrite every content_request targeting them.
 
@@ -562,7 +680,14 @@ def build_slide_with_placeholders(
     placeholder_ids: Dict[str, str] = {}
     placeholder_mappings: List[Dict[str, Any]] = []
     skipped_fields: List[str] = []
-    # pseudo_id -> (slide_id, placeholder_type, layout_index_to_match)
+    # pseudo_id -> (slide_id, placeholder_type, occurrence_to_match)
+    # `occurrence_to_match` is the 0-based ORDER of the placeholder among
+    # same-type placeholders on the slide (NOT the layout-level `index` value).
+    # We store occurrence (not the layout's raw `index` value) because
+    # slide-level `placeholder.index` reported by `presentations.get` is not
+    # always equal to the corresponding layout-level `index`. Matching by
+    # ascending-`index` order is the only reliable way to map the N-th BODY of
+    # the layout to the N-th BODY actually materialized on the slide.
     deferred_lookups: Dict[str, Tuple[str, str, int]] = {}
 
     def _allocate_placeholder(
@@ -588,8 +713,7 @@ def build_slide_with_placeholders(
         ph_id = gen_id("ph")
         placeholder_ids[semantic_name] = ph_id
         if _is_multi_occurrence(ph_type):
-            layout_index = indexes[occurrence]
-            deferred_lookups[ph_id] = (slide_id, ph_type, layout_index)
+            deferred_lookups[ph_id] = (slide_id, ph_type, occurrence)
             return ph_id
         # Singleton or predefined: traditional pre-binding works fine.
         mapping = _build_layout_placeholder_mapping(ph_type, occurrence=occurrence)
@@ -616,9 +740,43 @@ def build_slide_with_placeholders(
         body_texts = [("" if v is None else str(v)) for v in body_value]
     elif body_value:
         body_texts = [str(body_value)]
+
+    # body indexes that should be rendered as a free-floating TEXT_BOX
+    # overlay (workaround for the Slides multi-BODY ghost bug). We track
+    # i -> (overlay_object_id, size, transform) so the content-building
+    # phase below can emit the correct createShape + insertText sequence.
+    body_overlays: Dict[int, Tuple[str, Dict[str, Any], Dict[str, Any]]] = {}
+
     for i, body_text in enumerate(body_texts):
         if not body_text:
             continue
+
+        # Multi-occurrence custom-layout BODY placeholders: the FIRST one
+        # (occurrence 0) accepts text via the deferred-rebind path. Every
+        # subsequent BODY placeholder of the same layout is created in a
+        # corrupt "ghost" state by Slides — `insertText` against it always
+        # returns HTTP 500 regardless of how the objectId was bound. Bypass
+        # the broken placeholder by laying a free-floating TEXT_BOX shape
+        # over its layout-defined geometry. The slide-level placeholder
+        # remains underneath but is empty, so its prompt is hidden behind
+        # our text box (and prompts never render in present mode).
+        if (
+            "layoutId" in layout_ref
+            and i >= 1
+            and len(layout_placeholders_by_type.get("BODY") or []) > 1
+        ):
+            geom = get_layout_placeholder_geometry(
+                presentation, layout_ref["layoutId"], "BODY", i
+            )
+            if geom is not None:
+                size, transform = geom
+                overlay_id = gen_id("body_tb")
+                placeholder_ids[f"body[{i}]"] = overlay_id
+                body_overlays[i] = (overlay_id, size, transform)
+                continue
+            # Geometry not available — fall through to the normal placeholder
+            # path so we at least try (and skip cleanly if it fails).
+
         allocated = _allocate_placeholder("BODY", i, f"body[{i}]")
         if allocated is None:
             skipped_fields.append(f"body[{i}] (BODY)")
@@ -677,6 +835,32 @@ def build_slide_with_placeholders(
             style = body_style[i] if i < len(body_style) else None
         else:
             style = body_style
+
+        overlay = body_overlays.get(i)
+        if overlay is not None:
+            # Multi-BODY ghost-bug workaround: emit a TEXT_BOX overlay at
+            # the layout's body[i] geometry, then insertText into it. The
+            # underlying broken slide-level placeholder is left alone but
+            # is empty; our overlay covers its prompt visually.
+            overlay_id, size, transform = overlay
+            content_requests.append(
+                {
+                    "createShape": {
+                        "objectId": overlay_id,
+                        "shapeType": "TEXT_BOX",
+                        "elementProperties": {
+                            "pageObjectId": slide_id,
+                            "size": size,
+                            "transform": transform,
+                        },
+                    }
+                }
+            )
+            content_requests.extend(
+                build_text_insert_requests(overlay_id, body_text, style)
+            )
+            continue
+
         content_requests.extend(build_text_insert_requests(ph_id, body_text, style))
 
     # Fill PICTURE placeholder(s) via replaceImage. The placeholder we mapped

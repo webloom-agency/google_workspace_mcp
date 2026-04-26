@@ -1217,7 +1217,7 @@ async def create_audit_presentation(
         # same batch reliably triggers HTTP 500s against custom layouts.
         per_slide_content: List[Tuple[int, List[Dict[str, Any]]]] = []
         slide_id_index_pairs: List[Tuple[str, int]] = []
-        # Aggregated pseudo-objectId → (slide_id, ph_type, layout_index) map.
+        # Aggregated pseudo-objectId → (slide_id, ph_type, occurrence) map.
         # Resolved post-Phase-A by reading the live deck and replacing pseudo
         # IDs in every content request with the real auto-assigned objectId.
         # This is the workaround for the Slides multi-same-type-placeholder
@@ -1349,23 +1349,65 @@ async def create_audit_presentation(
         # second+ binding is a "ghost" — objectId visible in pageElements
         # but underlying shape unwired, causing HTTP 500 on insertText).
         # Now that the slides exist with auto-assigned IDs, we look up the
-        # real objectId for each (slide_id, ph_type, layout_index) we
+        # real objectId for each (slide_id, ph_type, occurrence) we
         # registered in `all_deferred_lookups` and rewrite every content
         # request that targets the corresponding pseudo objectId.
+        #
+        # Matching strategy: we match by ASCENDING-INDEX ORDER (occurrence),
+        # NOT by raw `index` value. The slide-level `placeholder.index`
+        # reported by `presentations.get` is not always equal to the
+        # corresponding layout-level `index`; ordering by ascending index
+        # is the only reliable way to map "the N-th BODY of the layout"
+        # to "the N-th BODY actually materialized on the slide".
+
+        # Pre-group each slide's placeholders by type, sorted by ascending
+        # slide-level index so position-N == occurrence-N.
+        slide_phs_by_type: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        for slide_id_key, phs_list in verify_slide_placeholders.items():
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for ph in phs_list:
+                ph_type = ph.get("type") or ""
+                if ph_type:
+                    grouped.setdefault(ph_type, []).append(ph)
+            for t in grouped:
+                grouped[t].sort(key=lambda p: p.get("index", 0))
+            slide_phs_by_type[slide_id_key] = grouped
+
         rebind_map: Dict[str, str] = {}
         unresolved_lookups: List[str] = []
-        for pseudo_id, (slide_id_for_lookup, ph_type, layout_index) in all_deferred_lookups.items():
-            phs = verify_slide_placeholders.get(slide_id_for_lookup, [])
+        slides_with_deferred: set = set()
+        for pseudo_id, (slide_id_for_lookup, ph_type, occurrence) in all_deferred_lookups.items():
+            slides_with_deferred.add(slide_id_for_lookup)
+            grouped = slide_phs_by_type.get(slide_id_for_lookup, {})
+            sorted_phs = grouped.get(ph_type, [])
             real_id: Optional[str] = None
-            for ph in phs:
-                if ph.get("type") == ph_type and ph.get("index", 0) == layout_index:
-                    real_id = ph.get("objectId")
-                    break
+            if occurrence < len(sorted_phs):
+                real_id = sorted_phs[occurrence].get("objectId")
             if real_id:
                 rebind_map[pseudo_id] = real_id
             else:
                 unresolved_lookups.append(
-                    f"{pseudo_id}->({ph_type},index={layout_index},slide={slide_id_for_lookup})"
+                    f"{pseudo_id}->({ph_type},occ={occurrence},slide={slide_id_for_lookup},"
+                    f"available={[(p.get('type'), p.get('index'), p.get('objectId')) for p in sorted_phs]})"
+                )
+
+        # Diagnostic: dump the live placeholder layout for slides that had
+        # deferred lookups so we can see exactly what Slides reports vs
+        # what we asked for. Helps diagnose the recurring "second BODY
+        # never gets text" issue on multi-occurrence layouts.
+        if slides_with_deferred:
+            for slide_id_key in sorted(slides_with_deferred):
+                phs_dump = [
+                    {
+                        "type": p.get("type"),
+                        "index": p.get("index"),
+                        "objectId": p.get("objectId"),
+                    }
+                    for p in verify_slide_placeholders.get(slide_id_key, [])
+                ]
+                logger.info(
+                    f"[create_audit_presentation] Live placeholders on "
+                    f"slide {slide_id_key} (had deferred lookups): {phs_dump}"
                 )
 
         if unresolved_lookups:
