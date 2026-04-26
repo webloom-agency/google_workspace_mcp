@@ -65,6 +65,45 @@ def _list_template_layouts(presentation: Dict[str, Any]) -> List[str]:
     return names
 
 
+def get_layout_placeholders_by_type(
+    presentation: Dict[str, Any], layout_object_id: str
+) -> Dict[str, List[int]]:
+    """Return the *actual* placeholder indexes a layout exposes, grouped by type.
+
+    Custom layouts created in the Slides editor (and derived layouts whose
+    internal `name` looks like 'TITLE_AND_BODY_1_2') do NOT necessarily have
+    placeholders at sequential indexes 0, 1, 2... Google assigns indexes at
+    creation time and they can be sparse / non-zero. Hard-coding `index: 0`
+    in `placeholderIdMappings` then either silently fails to bind (and our
+    insertText hits a non-existent objectId) or — more commonly — makes the
+    Slides backend return a non-specific HTTP 500 ('Internal error
+    encountered') for the entire `createSlide` request.
+
+    Use this helper to discover the real indexes for the layout the slide
+    targets, then map each requested placeholder to one of them.
+
+    Returns a dict like {"TITLE": [0], "BODY": [3, 7], "PICTURE": [9]} where
+    every list is sorted ascending.
+    """
+    out: Dict[str, List[int]] = {}
+    for layout in presentation.get("layouts", []) or []:
+        if layout.get("objectId") != layout_object_id:
+            continue
+        for element in layout.get("pageElements", []) or []:
+            shape = element.get("shape") or {}
+            placeholder = shape.get("placeholder")
+            if not placeholder:
+                continue
+            ptype = placeholder.get("type")
+            pindex = placeholder.get("index", 0)
+            if ptype:
+                out.setdefault(ptype, []).append(int(pindex))
+        break
+    for ptype in out:
+        out[ptype] = sorted(set(out[ptype]))
+    return out
+
+
 def resolve_layout_reference(
     presentation: Dict[str, Any], layout_name: str
 ) -> Dict[str, Any]:
@@ -443,11 +482,52 @@ def build_slide_with_placeholders(
     layout_name = slide_spec.get("layout") or "BLANK"
     layout_ref = resolve_layout_reference(presentation, layout_name)
 
+    # Discover the layout's REAL placeholder indexes (only for custom layouts;
+    # predefined layouts always expose unique placeholders at index 0). This
+    # is critical because the Slides backend returns a non-specific HTTP 500
+    # ('Internal error encountered') if a `placeholderIdMapping` references a
+    # type/index combo the layout doesn't actually have — and custom layouts
+    # in the editor get arbitrary indexes (BODY can land at 3, 7, etc).
+    layout_placeholders_by_type: Dict[str, List[int]] = {}
+    if "layoutId" in layout_ref:
+        layout_placeholders_by_type = get_layout_placeholders_by_type(
+            presentation, layout_ref["layoutId"]
+        )
+
+    def _build_layout_placeholder_mapping(
+        ph_type: str, occurrence: int = 0
+    ) -> Optional[Dict[str, Any]]:
+        """Build a `layoutPlaceholder` mapping object for the `occurrence`-th placeholder
+        of `ph_type` in the resolved layout. Returns None if the layout has no such
+        placeholder.
+
+        Per Google's docs: when the layout has a single placeholder of a given type,
+        OMITTING `index` is the canonical way to bind to it — the Slides backend
+        will match by type alone. We only emit `index` when there are multiple
+        placeholders of the same type (e.g. BODY[0] / BODY[1] in a two-column
+        layout) where disambiguation is genuinely needed.
+
+        For predefined layouts (no `layoutId` in `layout_ref`) we don't have the
+        placeholder list, so we fall back to the legacy index = `occurrence` behavior,
+        which works because predefined layouts are well-defined.
+        """
+        if "predefinedLayout" in layout_ref:
+            mapping = {"type": ph_type}
+            if occurrence > 0:
+                mapping["index"] = occurrence
+            return mapping
+        indexes = layout_placeholders_by_type.get(ph_type) or []
+        if occurrence >= len(indexes):
+            return None
+        if len(indexes) == 1:
+            return {"type": ph_type}
+        return {"type": ph_type, "index": indexes[occurrence]}
+
     fields = slide_spec.get("fields") or {}
     placeholder_ids: Dict[str, str] = {}
     placeholder_mappings: List[Dict[str, Any]] = []
+    skipped_fields: List[str] = []
 
-    # Single-instance text placeholders (always at layout index 0).
     simple_text_fields = {
         "title": "TITLE",
         "centered_title": "CENTERED_TITLE",
@@ -455,17 +535,16 @@ def build_slide_with_placeholders(
     }
     for field_name, ph_type in simple_text_fields.items():
         if field_name in fields and fields[field_name]:
+            placeholder_obj = _build_layout_placeholder_mapping(ph_type, occurrence=0)
+            if placeholder_obj is None:
+                skipped_fields.append(f"{field_name} ({ph_type})")
+                continue
             ph_id = gen_id("ph")
             placeholder_ids[field_name] = ph_id
             placeholder_mappings.append(
-                {
-                    "layoutPlaceholder": {"type": ph_type, "index": 0},
-                    "objectId": ph_id,
-                }
+                {"layoutPlaceholder": placeholder_obj, "objectId": ph_id}
             )
 
-    # BODY: supports a string (single BODY at index 0) OR a list (multi-column
-    # layouts where the layout exposes BODY at index 0, 1, 2, ...).
     body_value = fields.get("body")
     body_texts: List[str] = []
     if isinstance(body_value, list):
@@ -475,20 +554,18 @@ def build_slide_with_placeholders(
     for i, body_text in enumerate(body_texts):
         if not body_text:
             continue
+        placeholder_obj = _build_layout_placeholder_mapping("BODY", occurrence=i)
+        if placeholder_obj is None:
+            skipped_fields.append(f"body[{i}] (BODY)")
+            continue
         ph_id = gen_id("ph")
         placeholder_ids[f"body[{i}]"] = ph_id
         placeholder_mappings.append(
-            {
-                "layoutPlaceholder": {"type": "BODY", "index": i},
-                "objectId": ph_id,
-            }
+            {"layoutPlaceholder": placeholder_obj, "objectId": ph_id}
         )
 
-    # PICTURE placeholders ("espace réservé image"). Specified per slide as
-    # `image_placeholders`: either a list of URL strings or a list of dicts
-    # of the form {"url": "...", "method": "CENTER_INSIDE"|"CENTER_CROP"}.
     image_placeholder_specs = slide_spec.get("image_placeholders") or []
-    image_fill: List[Tuple[str, Dict[str, Any]]] = []  # (placeholder_id, spec)
+    image_fill: List[Tuple[str, Dict[str, Any]]] = []
     for i, raw in enumerate(image_placeholder_specs):
         if isinstance(raw, str):
             spec = {"url": raw}
@@ -498,15 +575,23 @@ def build_slide_with_placeholders(
             continue
         if not spec.get("url"):
             continue
+        placeholder_obj = _build_layout_placeholder_mapping("PICTURE", occurrence=i)
+        if placeholder_obj is None:
+            skipped_fields.append(f"image[{i}] (PICTURE)")
+            continue
         ph_id = gen_id("ph")
         placeholder_ids[f"image[{i}]"] = ph_id
         placeholder_mappings.append(
-            {
-                "layoutPlaceholder": {"type": "PICTURE", "index": i},
-                "objectId": ph_id,
-            }
+            {"layoutPlaceholder": placeholder_obj, "objectId": ph_id}
         )
         image_fill.append((ph_id, spec))
+
+    if skipped_fields:
+        # Surface this as part of the returned placeholder_ids so the caller can
+        # log it. We don't raise: a missing placeholder in the layout is a soft
+        # mismatch, not a fatal error — better to render the rest of the slide
+        # than to abort the whole deck.
+        placeholder_ids["__skipped__"] = ",".join(skipped_fields)
 
     creation_requests: List[Dict[str, Any]] = [
         build_create_slide(

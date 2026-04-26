@@ -904,7 +904,7 @@ async def create_audit_presentation(
         slide_id_index_pairs: List[Tuple[str, int]] = []
 
         for index, slide_spec in enumerate(slides):
-            slide_id, slide_creation, slide_content, _placeholders = B.build_slide_with_placeholders(
+            slide_id, slide_creation, slide_content, slide_placeholders = B.build_slide_with_placeholders(
                 presentation=presentation,
                 slide_spec=slide_spec,
                 insertion_index=slide_offset + index,
@@ -912,6 +912,15 @@ async def create_audit_presentation(
             slide_id_index_pairs.append((slide_id, index))
             creation_requests.extend(slide_creation)
             content_requests.extend(slide_content)
+            skipped = slide_placeholders.get("__skipped__")
+            if skipped:
+                logger.warning(
+                    f"[create_audit_presentation] Slide #{index + 1} layout="
+                    f"'{slide_spec.get('layout')}': layout has no placeholder for "
+                    f"{skipped}; those fields will not be rendered. Add the missing "
+                    f"placeholder(s) to the layout in your template, or remove the "
+                    f"corresponding field(s) from the slide JSON."
+                )
 
             chart_spec = slide_spec.get("chart")
             if chart_spec:
