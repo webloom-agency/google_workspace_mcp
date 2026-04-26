@@ -876,6 +876,13 @@ fonts. The template is **never modified**.
 ```json
 {
   "title": "Pré-audit SEO - edaa.fr - 2026-04",
+  "chart_defaults": {
+    "series_colors": ["#1A73E8", "#34A853", "#FBBC04", "#EA4335"],
+    "background_color": "#FFFFFF",
+    "font_family": "Roboto",
+    "title_text_format": { "bold": true, "font_size": 14, "foreground_color": "#202124" },
+    "legend_position": "BOTTOM_LEGEND"
+  },
   "slides": [
     {
       "layout": "TITLE",
@@ -927,6 +934,23 @@ fonts. The template is **never modified**.
       "fields": { "title": "Recommandations" }
     },
     {
+      "layout": "Title + Two Columns",
+      "fields": {
+        "title": "Avant / Après",
+        "body": [
+          "Avant : score 59/100, trafic -36% YoY, GEO 10/100.",
+          "Après : objectif 80/100, +25% trafic, GEO 60/100."
+        ]
+      }
+    },
+    {
+      "layout": "Cover",
+      "fields": { "title": "Pré-audit SEO" },
+      "image_placeholders": [
+        "https://drive.google.com/uc?export=view&id=LAPTOP_FILE_ID"
+      ]
+    },
+    {
       "layout": "BLANK",
       "title": "Capture homepage",
       "image": {
@@ -943,17 +967,55 @@ fonts. The template is **never modified**.
 | Field | Purpose |
 |---|---|
 | `layout` | Predefined layout name (`TITLE`, `TITLE_AND_BODY`, `BLANK`, `SECTION_HEADER`, `BIG_NUMBER`, ...) or a custom template layout's display name. |
-| `fields.title` / `fields.subtitle` / `fields.body` | Fills the matching layout placeholders. |
+| `fields.title` / `fields.subtitle` | Fills the single TITLE/SUBTITLE placeholder. |
+| `fields.body` | Fills the BODY placeholder. Pass a **string** for a single-body layout, or a **list of strings** for layouts that expose multiple BODY placeholders (e.g. two-column layouts). Item `i` fills the BODY at layout index `i`. |
+| `image_placeholders` | List of items targeting **PICTURE placeholders** ("espace réservé image") in the layout. Each item is either a URL string or `{"url": "...", "method": "CENTER_INSIDE"\|"CENTER_CROP"}`. Item `i` fills the PICTURE at layout index `i`. |
 | `title` (top-level, on `BLANK`) | Adds a free-floating title text box. |
 | `table` | `{headers, rows, position?, header_style?, body_style?}` — creates a real `Table` element you can re-style by hand later. |
 | `chart` | `{type, title?, data:{headers, rows}, position?, value_axis_title?, domain_axis_title?, legend_position?, width_pixels?, height_pixels?}` — becomes a native Sheets chart embedded as `LINKED`, so refreshing the Sheet refreshes the deck. |
-| `image` | `{url, position?}` — must be a publicly accessible URL. |
+| `image` | `{url, position?}` — free-floating image, **not** a placeholder. Must be a publicly accessible URL. |
 | `text_boxes` | List of `{text, position?, style?, alignment?}` for free placement. |
 | `speaker_notes` | Plain text added to the slide's notes page. |
 
 **Supported chart types**: `BAR`, `COLUMN`, `LINE`, `AREA`, `SCATTER`, `COMBO`, `STEPPED_AREA`, `PIE`, `DOUGHNUT`. Convention: column 0 of `data.rows` is the X axis (or pie domain); remaining columns are series.
 
 Coordinates use **points (PT)**. The default page is 720 × 405 PT (standard widescreen).
+
+#### Chart styling (brand colors, fonts, background)
+
+Embedded Sheets charts do **not** automatically inherit your Slides template's theme — they are rendered by Sheets, which has its own default palette. To get on-brand charts:
+
+1. **Set deck-wide defaults once** in `deck.chart_defaults`:
+
+   ```json
+   "chart_defaults": {
+     "series_colors": ["#1A73E8", "#34A853", "#FBBC04", "#EA4335"],
+     "background_color": "#FFFFFF",
+     "font_family": "Roboto",
+     "title_text_format": { "bold": true, "font_size": 14, "foreground_color": "#202124" },
+     "legend_position": "BOTTOM_LEGEND",
+     "stacked_type": "STACKED"
+   }
+   ```
+
+2. **Override per chart** by repeating any of those fields inside a single `chart` block. Per-chart values win:
+
+   ```json
+   { "type": "COLUMN", "title": "Scores",
+     "data": { "headers": ["Pilier", "Score"], "rows": [["Tech", 90], ["Contenu", 64]] },
+     "series_colors": ["#FF6F00"],
+     "title_text_format": { "bold": true, "font_size": 18, "foreground_color": "#FF6F00" }
+   }
+   ```
+
+| Style field | Applies to | Notes |
+|---|---|---|
+| `series_colors` | Bar / Column / Line / Area / Scatter / Combo / Stepped area | List of HEX strings, cycled across series. Pie/doughnut slice colors are not controllable here (Google API limitation). |
+| `background_color` | All chart types | HEX, e.g. `"#FFFFFF"`. |
+| `font_family` | All chart types | Default font for the whole chart. |
+| `title_text_format` | All chart types | `{bold, italic, font_size, font_family, foreground_color}` — all keys optional. |
+| `legend_position` | All chart types | `BOTTOM_LEGEND` (default), `LEFT_LEGEND`, `RIGHT_LEGEND`, `TOP_LEGEND`, `NO_LEGEND`. |
+| `stacked_type` | Bar / Column / Area only | `NONE`, `STACKED`, `PERCENT_STACKED`. Ignored for other chart types. |
 
 #### Example call
 

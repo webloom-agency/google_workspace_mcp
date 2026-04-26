@@ -393,27 +393,66 @@ def build_slide_with_placeholders(
     placeholder_ids: Dict[str, str] = {}
     placeholder_mappings: List[Dict[str, Any]] = []
 
-    # Map semantic field -> placeholder type the Slides API exposes.
-    placeholder_type_for_field = {
+    # Single-instance text placeholders (always at layout index 0).
+    simple_text_fields = {
         "title": "TITLE",
-        "subtitle": "SUBTITLE",
-        "body": "BODY",
         "centered_title": "CENTERED_TITLE",
+        "subtitle": "SUBTITLE",
     }
-
-    for field_name in ("title", "centered_title", "subtitle", "body"):
+    for field_name, ph_type in simple_text_fields.items():
         if field_name in fields and fields[field_name]:
             ph_id = gen_id("ph")
             placeholder_ids[field_name] = ph_id
             placeholder_mappings.append(
                 {
-                    "layoutPlaceholder": {
-                        "type": placeholder_type_for_field[field_name],
-                        "index": 0,
-                    },
+                    "layoutPlaceholder": {"type": ph_type, "index": 0},
                     "objectId": ph_id,
                 }
             )
+
+    # BODY: supports a string (single BODY at index 0) OR a list (multi-column
+    # layouts where the layout exposes BODY at index 0, 1, 2, ...).
+    body_value = fields.get("body")
+    body_texts: List[str] = []
+    if isinstance(body_value, list):
+        body_texts = [("" if v is None else str(v)) for v in body_value]
+    elif body_value:
+        body_texts = [str(body_value)]
+    for i, body_text in enumerate(body_texts):
+        if not body_text:
+            continue
+        ph_id = gen_id("ph")
+        placeholder_ids[f"body[{i}]"] = ph_id
+        placeholder_mappings.append(
+            {
+                "layoutPlaceholder": {"type": "BODY", "index": i},
+                "objectId": ph_id,
+            }
+        )
+
+    # PICTURE placeholders ("espace réservé image"). Specified per slide as
+    # `image_placeholders`: either a list of URL strings or a list of dicts
+    # of the form {"url": "...", "method": "CENTER_INSIDE"|"CENTER_CROP"}.
+    image_placeholder_specs = slide_spec.get("image_placeholders") or []
+    image_fill: List[Tuple[str, Dict[str, Any]]] = []  # (placeholder_id, spec)
+    for i, raw in enumerate(image_placeholder_specs):
+        if isinstance(raw, str):
+            spec = {"url": raw}
+        elif isinstance(raw, dict):
+            spec = raw
+        else:
+            continue
+        if not spec.get("url"):
+            continue
+        ph_id = gen_id("ph")
+        placeholder_ids[f"image[{i}]"] = ph_id
+        placeholder_mappings.append(
+            {
+                "layoutPlaceholder": {"type": "PICTURE", "index": i},
+                "objectId": ph_id,
+            }
+        )
+        image_fill.append((ph_id, spec))
 
     requests: List[Dict[str, Any]] = [
         build_create_slide(
@@ -424,10 +463,43 @@ def build_slide_with_placeholders(
         )
     ]
 
-    for field_name, ph_id in placeholder_ids.items():
+    # Fill simple single-instance text placeholders.
+    for field_name in simple_text_fields:
+        ph_id = placeholder_ids.get(field_name)
+        if not ph_id:
+            continue
         text = str(fields.get(field_name) or "")
         style = (slide_spec.get("styles") or {}).get(field_name)
         requests.extend(build_text_insert_requests(ph_id, text, style))
+
+    # Fill BODY placeholder(s). Style may be a single dict (applied to all
+    # body shapes) or a list aligned with the body texts.
+    body_style = (slide_spec.get("styles") or {}).get("body")
+    for i, body_text in enumerate(body_texts):
+        ph_id = placeholder_ids.get(f"body[{i}]")
+        if not ph_id:
+            continue
+        if isinstance(body_style, list):
+            style = body_style[i] if i < len(body_style) else None
+        else:
+            style = body_style
+        requests.extend(build_text_insert_requests(ph_id, body_text, style))
+
+    # Fill PICTURE placeholder(s) via replaceImage. The placeholder we mapped
+    # is created on the slide as an Image element holding the layout's
+    # placeholder image; replaceImage swaps its bitmap for our URL while
+    # preserving the placeholder's size, position, and crop.
+    for ph_id, spec in image_fill:
+        method = spec.get("method") or "CENTER_INSIDE"
+        requests.append(
+            {
+                "replaceImage": {
+                    "imageObjectId": ph_id,
+                    "url": spec["url"],
+                    "imageReplaceMethod": method,
+                }
+            }
+        )
 
     # Free-floating title for BLANK-ish layouts when caller passes top-level "title".
     standalone_title = slide_spec.get("title")

@@ -40,6 +40,58 @@ MAX_CHARTS_PER_SHEETS_BATCH = 20
 _BASIC_CHART_TYPES = {"BAR", "COLUMN", "LINE", "AREA", "SCATTER", "COMBO", "STEPPED_AREA"}
 _PIE_CHART_TYPES = {"PIE", "DOUGHNUT"}
 
+# Style fields that flow from deck.chart_defaults into each chart, or that a single chart
+# can override directly in its `chart` block. Anything not in this list is ignored.
+_CHART_STYLE_FIELDS = (
+    "series_colors",
+    "background_color",
+    "font_family",
+    "title_text_format",
+    "legend_position",
+    "stacked_type",
+)
+
+
+def _hex_to_rgb_color(hex_color: str) -> Dict[str, float]:
+    """'#1A73E8' -> {'red': 0.10..., 'green': 0.45..., 'blue': 0.91...}."""
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        raise Exception(f"Invalid HEX color '{hex_color}'. Expected #RRGGBB.")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return {"red": r / 255.0, "green": g / 255.0, "blue": b / 255.0}
+
+
+def _build_text_format(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate a friendly text-format dict into the Sheets API's TextFormat shape.
+
+    Accepted keys: bold, italic, font_size, font_family, foreground_color (HEX).
+    """
+    out: Dict[str, Any] = {}
+    if spec.get("bold") is not None:
+        out["bold"] = bool(spec["bold"])
+    if spec.get("italic") is not None:
+        out["italic"] = bool(spec["italic"])
+    if spec.get("font_size") is not None:
+        out["fontSize"] = int(spec["font_size"])
+    if spec.get("font_family"):
+        out["fontFamily"] = str(spec["font_family"])
+    if spec.get("foreground_color"):
+        out["foregroundColorStyle"] = {"rgbColor": _hex_to_rgb_color(spec["foreground_color"])}
+    return out
+
+
+def _effective_chart_style(
+    chart_defaults: Optional[Dict[str, Any]], chart_spec: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge per-chart style on top of deck-level chart_defaults. Per-chart wins per-key."""
+    style: Dict[str, Any] = {}
+    for key in _CHART_STYLE_FIELDS:
+        if chart_defaults and key in chart_defaults and chart_defaults[key] is not None:
+            style[key] = chart_defaults[key]
+        if key in chart_spec and chart_spec[key] is not None:
+            style[key] = chart_spec[key]
+    return style
+
 
 # -----------------------------
 # Drive / template helpers
@@ -123,8 +175,14 @@ def _build_chart_addchart_request(
     chart_spec: Dict[str, Any],
     data_rows: int,
     data_columns: int,
+    style: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build a single `addChart` request given a chart spec and the data range geometry."""
+    """Build a single `addChart` request given a chart spec, geometry, and optional style.
+
+    `style` is the merged result of deck.chart_defaults + per-chart overrides, see
+    `_effective_chart_style`.
+    """
+    style = style or {}
     chart_type = chart_spec.get("type", "BAR").upper()
     title = chart_spec.get("title")
 
@@ -150,6 +208,10 @@ def _build_chart_addchart_request(
     if title:
         spec["title"] = title
 
+    legend_position = (
+        chart_spec.get("legend_position") or style.get("legend_position") or "BOTTOM_LEGEND"
+    )
+
     if chart_type in _BASIC_CHART_TYPES:
         axis: List[Dict[str, Any]] = []
         if chart_spec.get("domain_axis_title"):
@@ -157,21 +219,33 @@ def _build_chart_addchart_request(
         if chart_spec.get("value_axis_title"):
             axis.append({"position": "LEFT_AXIS", "title": chart_spec["value_axis_title"]})
 
-        spec["basicChart"] = {
+        series_palette = style.get("series_colors") or []
+        series_list: List[Dict[str, Any]] = []
+        for idx, src in enumerate(series_sources):
+            series_entry: Dict[str, Any] = {
+                "series": {"sourceRange": {"sources": [src]}},
+                "targetAxis": "LEFT_AXIS",
+            }
+            if series_palette:
+                color_hex = series_palette[idx % len(series_palette)]
+                series_entry["colorStyle"] = {"rgbColor": _hex_to_rgb_color(color_hex)}
+            series_list.append(series_entry)
+
+        basic_chart: Dict[str, Any] = {
             "chartType": chart_type,
-            "legendPosition": chart_spec.get("legend_position", "BOTTOM_LEGEND"),
+            "legendPosition": legend_position,
             "headerCount": 1,
             "domains": [{"domain": {"sourceRange": {"sources": [domain_source]}}}],
-            "series": [
-                {"series": {"sourceRange": {"sources": [src]}}, "targetAxis": "LEFT_AXIS"}
-                for src in series_sources
-            ],
+            "series": series_list,
         }
         if axis:
-            spec["basicChart"]["axis"] = axis
+            basic_chart["axis"] = axis
+        if style.get("stacked_type"):
+            basic_chart["stackedType"] = str(style["stacked_type"]).upper()
+        spec["basicChart"] = basic_chart
     elif chart_type in _PIE_CHART_TYPES:
         spec["pieChart"] = {
-            "legendPosition": chart_spec.get("legend_position", "BOTTOM_LEGEND"),
+            "legendPosition": legend_position,
             "domain": {"sourceRange": {"sources": [domain_source]}},
             "series": {"sourceRange": {"sources": [series_sources[0]]}},
         }
@@ -182,6 +256,13 @@ def _build_chart_addchart_request(
             f"Unsupported chart type '{chart_type}'. "
             f"Supported: {sorted(_BASIC_CHART_TYPES | _PIE_CHART_TYPES)}"
         )
+
+    if style.get("background_color"):
+        spec["backgroundColorStyle"] = {"rgbColor": _hex_to_rgb_color(style["background_color"])}
+    if style.get("font_family"):
+        spec["fontName"] = str(style["font_family"])
+    if style.get("title_text_format"):
+        spec["titleTextFormat"] = _build_text_format(style["title_text_format"])
 
     return {
         "addChart": {
@@ -209,6 +290,7 @@ async def _create_data_sheet_and_charts(
     title: str,
     target_folder_id: Optional[str],
     chart_specs: List[Dict[str, Any]],
+    chart_defaults: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], List[Tuple[str, int]]]:
     """Create one Sheet with one tab per chart, write data, create charts, return (sheet_meta, chart_ids).
 
@@ -278,6 +360,7 @@ async def _create_data_sheet_and_charts(
             chart_spec=chart_specs[chart_idx],
             data_rows=n_rows,
             data_columns=n_cols,
+            style=_effective_chart_style(chart_defaults, chart_specs[chart_idx]),
         )
         for (chart_idx, n_rows, n_cols) in geometry
     ]
@@ -395,10 +478,28 @@ async def create_audit_presentation(
     `deck` JSON shape:
       {
         "title": "Pre-audit SEO - edaa.fr - 2026-04",
+        "chart_defaults": {                           # optional, applied to every chart
+          "series_colors": ["#1A73E8", "#34A853", "#FBBC04", "#EA4335"],
+          "background_color": "#FFFFFF",
+          "font_family": "Roboto",
+          "title_text_format": {"bold": true, "font_size": 14, "foreground_color": "#202124"},
+          "legend_position": "BOTTOM_LEGEND",
+          "stacked_type": "STACKED"                   # NONE | STACKED | PERCENT_STACKED
+        },
         "slides": [
           {"layout": "TITLE", "fields": {"title": "...", "subtitle": "..."}},
           {"layout": "TITLE_AND_BODY", "fields": {"title": "...", "body": "..."},
            "speaker_notes": "..."},
+          # Two-column layout: pass `body` as a list. Item 0 fills BODY index 0
+          # (left column), item 1 fills BODY index 1 (right column), etc.
+          {"layout": "Title + Two Columns", "fields": {
+              "title": "Avant / Après",
+              "body": ["Avant: ...", "Après: ..."]}},
+          # PICTURE placeholder ("espace réservé image"): fill by ordinal
+          # index of the PICTURE placeholders in the layout. Each item is
+          # either a URL string or {"url": "...", "method": "CENTER_INSIDE"|"CENTER_CROP"}.
+          {"layout": "Cover", "fields": {"title": "Pré-audit SEO"},
+           "image_placeholders": ["https://example.com/laptop-mockup.png"]},
           {"layout": "BLANK", "title": "Free title", "table": {
               "headers": ["Metric", "Value"], "rows": [["...", "..."]]}},
           {"layout": "BLANK", "title": "Scores", "chart": {
@@ -534,6 +635,7 @@ async def create_audit_presentation(
 
         # 6) If any slide needs a chart, build the data Sheet first.
         flat_chart_specs = _annotate_chart_uids(deck)
+        chart_defaults = deck.get("chart_defaults") or None
         chart_id_by_uid: Dict[str, int] = {}
         if flat_chart_specs:
             data_sheet_meta, chart_pairs = await _create_data_sheet_and_charts(
@@ -542,6 +644,7 @@ async def create_audit_presentation(
                 title=final_title,
                 target_folder_id=target_folder_id,
                 chart_specs=flat_chart_specs,
+                chart_defaults=chart_defaults,
             )
             chart_id_by_uid = dict(chart_pairs)
 
