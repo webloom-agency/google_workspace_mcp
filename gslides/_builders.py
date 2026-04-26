@@ -65,6 +65,32 @@ def _list_template_layouts(presentation: Dict[str, Any]) -> List[str]:
     return names
 
 
+def get_element_placeholder(element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the placeholder dict on a PageElement, regardless of element kind.
+
+    The Slides API exposes placeholders on the kind-specific subobject of each
+    PageElement, NOT at the top level. Most placeholders ride on `shape`
+    (TITLE, BODY, SUBTITLE, SLIDE_NUMBER, ...), but PICTURE placeholders
+    created via the editor's `Insert → Placeholder → Image → Rectangle` path
+    are typed as `image` PageElements with the placeholder field hanging off
+    `image.placeholder`. Inspecting only `shape.placeholder` makes those
+    PICTURE slots invisible to the rest of the build pipeline — the layout
+    diagnostic claims the slot doesn't exist, `placeholderIdMappings` for
+    `image_placeholders` find no target, and `replaceImage` is dropped by the
+    orphan filter.
+
+    Returns the placeholder dict (with `type` and optional `index`) if the
+    element carries one in either location, else None.
+    """
+    shape_ph = (element.get("shape") or {}).get("placeholder")
+    if shape_ph:
+        return shape_ph
+    image_ph = (element.get("image") or {}).get("placeholder")
+    if image_ph:
+        return image_ph
+    return None
+
+
 def get_layout_placeholders_by_type(
     presentation: Dict[str, Any], layout_object_id: str
 ) -> Dict[str, List[int]]:
@@ -90,8 +116,7 @@ def get_layout_placeholders_by_type(
         if layout.get("objectId") != layout_object_id:
             continue
         for element in layout.get("pageElements", []) or []:
-            shape = element.get("shape") or {}
-            placeholder = shape.get("placeholder")
+            placeholder = get_element_placeholder(element)
             if not placeholder:
                 continue
             ptype = placeholder.get("type")
@@ -128,8 +153,7 @@ def get_layout_placeholder_geometry(
             continue
         candidates: List[Tuple[int, Dict[str, Any]]] = []
         for element in layout.get("pageElements", []) or []:
-            shape = element.get("shape") or {}
-            placeholder = shape.get("placeholder")
+            placeholder = get_element_placeholder(element)
             if not placeholder or placeholder.get("type") != ph_type:
                 continue
             candidates.append((int(placeholder.get("index", 0)), element))

@@ -1145,7 +1145,7 @@ async def create_audit_presentation(
             props = layout.get("layoutProperties") or {}
             phs: List[Dict[str, Any]] = []
             for el in layout.get("pageElements") or []:
-                placeholder = (el.get("shape") or {}).get("placeholder") or {}
+                placeholder = B.get_element_placeholder(el)
                 if not placeholder:
                     continue
                 phs.append(
@@ -1330,7 +1330,7 @@ async def create_audit_presentation(
                 continue
             phs: List[Dict[str, Any]] = []
             for el in page.get("pageElements", []) or []:
-                placeholder = (el.get("shape") or {}).get("placeholder") or {}
+                placeholder = B.get_element_placeholder(el)
                 if not placeholder:
                     continue
                 phs.append(
