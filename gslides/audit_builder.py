@@ -38,10 +38,11 @@ logger = logging.getLogger(__name__)
 # stacked in one batch alongside dependent `insertText` / `createTable` /
 # `replaceImage` requests — Google's backend regularly returns deterministic
 # HTTP 500s on such mixed batches for decks of ~25+ slides. We therefore split
-# the build into two homogeneous phases (creation, then content) and keep
-# batches small. 30 requests per batch is conservative but rock-solid even for
-# 100-slide decks.
-MAX_REQUESTS_PER_BATCH = 30
+# the build into two homogeneous phases (creation, then content), GROUP CONTENT
+# REQUESTS PER SLIDE (so a single batch never spans multiple slides), and cap
+# batch size aggressively. 10 requests per batch is conservative but rock-solid
+# even for 100-slide decks against custom-layout templates.
+MAX_REQUESTS_PER_BATCH = 10
 # Per-call addChart batches stay comfortably under Sheets quota.
 MAX_CHARTS_PER_SHEETS_BATCH = 20
 # Inter-batch pause to avoid bursting Slides/Sheets quota over many chunks.
@@ -520,6 +521,45 @@ async def _execute_slides_batches(
             await asyncio.sleep(INTER_BATCH_SLEEP_S)
 
 
+async def _execute_slides_per_slide(
+    slides_service,
+    presentation_id: str,
+    per_slide_requests: List[Tuple[int, List[Dict[str, Any]]]],
+) -> None:
+    """Run Slides content requests one slide at a time.
+
+    Each slide's content requests are sent in their own ``batchUpdate`` call
+    (chunked to ``MAX_REQUESTS_PER_BATCH`` if the slide has many cells / heavy
+    content like big tables). Crucially, a single ``batchUpdate`` is never
+    allowed to mix requests targeting different slides — that combination is
+    what reliably triggers ``HTTP 500: Internal error encountered`` against
+    custom-layout templates, even for content-only requests.
+
+    Each chunk goes through the per-call transient-retry helper, so a flake on
+    slide N does not abort the whole tool.
+    """
+    if not per_slide_requests:
+        return
+    total_slides = len(per_slide_requests)
+    for slide_pos, (slide_idx, slide_requests) in enumerate(per_slide_requests):
+        if not slide_requests:
+            continue
+        chunks = B.chunk_requests(slide_requests, MAX_REQUESTS_PER_BATCH)
+        for chunk_idx, chunk in enumerate(chunks):
+            label = (
+                f"slides.batchUpdate slide#{slide_idx + 1} "
+                f"({slide_pos + 1}/{total_slides}) chunk {chunk_idx + 1}/{len(chunks)} "
+                f"({len(chunk)} requests)"
+            )
+            await _run_with_transient_retry(
+                slides_service.presentations()
+                .batchUpdate(presentationId=presentation_id, body={"requests": chunk})
+                .execute,
+                label=label,
+            )
+            await asyncio.sleep(INTER_BATCH_SLEEP_S)
+
+
 async def _execute_slides_sequentially(
     slides_service,
     presentation_id: str,
@@ -934,7 +974,10 @@ async def create_audit_presentation(
         # HTTP 500s Google returns when createSlide and dependent inserts are
         # interleaved in the same batchUpdate.
         creation_requests: List[Dict[str, Any]] = []
-        content_requests: List[Dict[str, Any]] = []
+        # Per-slide content requests so each batchUpdate stays scoped to a
+        # single slide. Mixing content requests for multiple slides in the
+        # same batch reliably triggers HTTP 500s against custom layouts.
+        per_slide_content: List[Tuple[int, List[Dict[str, Any]]]] = []
         slide_id_index_pairs: List[Tuple[str, int]] = []
 
         for index, slide_spec in enumerate(slides):
@@ -945,7 +988,9 @@ async def create_audit_presentation(
             )
             slide_id_index_pairs.append((slide_id, index))
             creation_requests.extend(slide_creation)
-            content_requests.extend(slide_content)
+
+            this_slide_content: List[Dict[str, Any]] = list(slide_content)
+
             skipped = slide_placeholders.get("__skipped__")
             if skipped:
                 logger.warning(
@@ -966,7 +1011,7 @@ async def create_audit_presentation(
                     )
                 # createSheetsChart targets a slide that must already exist, so
                 # it runs in the content phase too.
-                content_requests.extend(
+                this_slide_content.extend(
                     B.build_sheets_chart_requests(
                         slide_id=slide_id,
                         spreadsheet_id=data_sheet_meta["spreadsheet_id"],
@@ -974,6 +1019,8 @@ async def create_audit_presentation(
                         position=chart_spec.get("position"),
                     )
                 )
+
+            per_slide_content.append((index, this_slide_content))
 
         # Phase A: create all slides first, ONE PER CALL. Slides batchUpdate
         # is unreliable when several `createSlide` requests targeting custom
@@ -994,15 +1041,20 @@ async def create_audit_presentation(
             creation_requests,
             label_prefix="slides.createSlide",
         )
-        # Phase B: fill every slide's content. By now every slide and every
-        # placeholder objectId we pre-allocated is fully committed, so these
-        # inserts/updates can never race a dependency, and they're tolerant
-        # of normal batching.
+        # Phase B: fill every slide's content. Requests are grouped PER SLIDE
+        # so a single batchUpdate never spans multiple slides — this is what
+        # eliminates the residual HTTP 500s on heterogeneous content batches
+        # against custom-layout templates. Heavy slides (e.g. big tables) are
+        # still chunked at MAX_REQUESTS_PER_BATCH within their own slide.
+        total_content_requests = sum(len(reqs) for _, reqs in per_slide_content)
         logger.info(
-            f"[create_audit_presentation] Phase B: applying {len(content_requests)} "
-            f"content request(s) in batches of {MAX_REQUESTS_PER_BATCH}."
+            f"[create_audit_presentation] Phase B: applying {total_content_requests} "
+            f"content request(s) per-slide (≤{MAX_REQUESTS_PER_BATCH} per batchUpdate, "
+            f"never crossing slide boundaries)."
         )
-        await _execute_slides_batches(slides_service, presentation_id, content_requests)
+        await _execute_slides_per_slide(
+            slides_service, presentation_id, per_slide_content
+        )
 
         # 8) Speaker notes pass: re-fetch to find each slide's speakerNotesObjectId, then insert.
         notes_specs: List[Tuple[int, str]] = [
