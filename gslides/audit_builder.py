@@ -1187,6 +1187,7 @@ async def create_audit_presentation(
             layout_placeholders_trace.append(
                 {
                     "displayName": props.get("displayName"),
+                    "name": props.get("name"),
                     "objectId": layout.get("objectId"),
                     "placeholders": phs,
                 }

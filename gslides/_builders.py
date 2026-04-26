@@ -129,6 +129,32 @@ def get_layout_placeholders_by_type(
     return out
 
 
+def find_predefined_layout_id(
+    presentation: Dict[str, Any], predefined_name: str
+) -> Optional[str]:
+    """Return the `objectId` of the layout whose internal name matches
+    `predefined_name` (e.g. 'TITLE_AND_BODY'), or None if absent.
+
+    Predefined Google layouts are exposed in `presentation.layouts[]` with
+    `layoutProperties.name == "<PREDEFINED_NAME>"`. When a user customizes a
+    template (deletes a placeholder from `TITLE_AND_BODY`, reorganizes
+    placeholders in `TITLE_AND_TWO_COLUMNS`, etc.) the predefined layout
+    keeps its name but its placeholder indexes can drift. Looking up the
+    layoutId lets us discover the layout's REAL placeholder structure and
+    avoid the same `placeholderIdMappings` trap we already work around for
+    custom layouts (HTTP 400 'placeholder is not on the page').
+    """
+    if not predefined_name:
+        return None
+    target = predefined_name.upper()
+    for layout in presentation.get("layouts", []) or []:
+        props = layout.get("layoutProperties", {}) or {}
+        name = (props.get("name") or "").upper()
+        if name == target:
+            return layout.get("objectId")
+    return None
+
+
 def get_layout_placeholder_geometry(
     presentation: Dict[str, Any],
     layout_object_id: str,
@@ -649,25 +675,37 @@ def build_slide_with_placeholders(
     layout_name = slide_spec.get("layout") or "BLANK"
     layout_ref = resolve_layout_reference(presentation, layout_name)
 
-    # Discover the layout's REAL placeholder indexes (only for custom layouts;
-    # predefined layouts always expose unique placeholders at index 0). This
-    # is critical because the Slides backend returns a non-specific HTTP 500
-    # ('Internal error encountered') if a `placeholderIdMapping` references a
-    # type/index combo the layout doesn't actually have — and custom layouts
-    # in the editor get arbitrary indexes (BODY can land at 3, 7, etc).
+    # Discover the layout's REAL placeholder indexes. This is critical
+    # because the Slides backend returns either HTTP 400 ('placeholder is
+    # not on the page') or HTTP 500 ('Internal error encountered') if a
+    # `placeholderIdMapping` references a type/index combo the layout
+    # doesn't actually have. We do this for BOTH custom layouts AND
+    # predefined ones (predefined layout names like `TITLE_AND_BODY` keep
+    # their name in customized templates, but a user might have deleted /
+    # reorganized their placeholders, which breaks the naive
+    # 'predefined layouts always have index 0' assumption).
     layout_placeholders_by_type: Dict[str, List[int]] = {}
+    discovered_layout_id: Optional[str] = None
     if "layoutId" in layout_ref:
+        discovered_layout_id = layout_ref["layoutId"]
+    elif "predefinedLayout" in layout_ref:
+        discovered_layout_id = find_predefined_layout_id(
+            presentation, layout_ref["predefinedLayout"]
+        )
+    if discovered_layout_id:
         layout_placeholders_by_type = get_layout_placeholders_by_type(
-            presentation, layout_ref["layoutId"]
+            presentation, discovered_layout_id
         )
 
     def _is_multi_occurrence(ph_type: str) -> bool:
-        """A custom layout has 2+ placeholders of `ph_type`?
+        """The resolved layout has 2+ placeholders of `ph_type`?
 
-        Predefined layouts never trigger the multi-mapping bug, so we only
-        defer for custom layouts (`layoutId` is set).
+        Triggers the deferred-rebind workaround for the Slides multi-BODY
+        ghost-bug. Applies to both custom AND predefined layouts that have
+        multiple same-type placeholders (e.g. predefined
+        `TITLE_AND_TWO_COLUMNS` has 2x BODY).
         """
-        if "layoutId" not in layout_ref:
+        if not layout_placeholders_by_type:
             return False
         return len(layout_placeholders_by_type.get(ph_type) or []) > 1
 
@@ -684,11 +722,12 @@ def build_slide_with_placeholders(
         placeholders of the same type (e.g. BODY[0] / BODY[1] in a two-column
         layout) where disambiguation is genuinely needed.
 
-        For predefined layouts (no `layoutId` in `layout_ref`) we don't have the
-        placeholder list, so we fall back to the legacy index = `occurrence` behavior,
-        which works because predefined layouts are well-defined.
+        If we couldn't discover the layout's actual placeholders (predefined
+        layout absent from `presentation.layouts[]`), fall back to the legacy
+        type+index behavior — better to attempt the binding than to skip the
+        slide entirely.
         """
-        if "predefinedLayout" in layout_ref:
+        if not layout_placeholders_by_type:
             mapping = {"type": ph_type}
             if occurrence > 0:
                 mapping["index"] = occurrence
@@ -732,7 +771,7 @@ def build_slide_with_placeholders(
             bug.
         """
         indexes = layout_placeholders_by_type.get(ph_type) or []
-        if "layoutId" in layout_ref and occurrence >= len(indexes):
+        if layout_placeholders_by_type and occurrence >= len(indexes):
             return None
         ph_id = gen_id("ph")
         placeholder_ids[semantic_name] = ph_id
@@ -785,12 +824,12 @@ def build_slide_with_placeholders(
         # remains underneath but is empty, so its prompt is hidden behind
         # our text box (and prompts never render in present mode).
         if (
-            "layoutId" in layout_ref
+            discovered_layout_id
             and i >= 1
             and len(layout_placeholders_by_type.get("BODY") or []) > 1
         ):
             geom = get_layout_placeholder_geometry(
-                presentation, layout_ref["layoutId"], "BODY", i
+                presentation, discovered_layout_id, "BODY", i
             )
             if geom is not None:
                 size, transform = geom
