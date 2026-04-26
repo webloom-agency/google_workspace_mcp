@@ -541,6 +541,20 @@ _OBJECT_REFERENCING_REQUEST_FIELDS: Dict[str, str] = {
     "deleteObject": "objectId",
 }
 
+# Phase B request types that CREATE a new pageElement with a custom objectId
+# we provide. These objects don't exist yet at verification time (Phase B
+# hasn't run) but the dependent requests (e.g. cell insertText into a freshly
+# created table) DO target them — so we must whitelist these IDs as
+# "will-exist" when filtering.
+_OBJECT_CREATING_REQUEST_KINDS: Tuple[str, ...] = (
+    "createTable",
+    "createShape",
+    "createImage",
+    "createLine",
+    "createVideo",
+    "createSheetsChart",
+)
+
 
 def _extract_target_object_id(request: Dict[str, Any]) -> Optional[str]:
     """Return the objectId a Slides request expects to ALREADY exist, or None.
@@ -554,6 +568,21 @@ def _extract_target_object_id(request: Dict[str, Any]) -> Optional[str]:
     for kind, field in _OBJECT_REFERENCING_REQUEST_FIELDS.items():
         if kind in request:
             return (request[kind] or {}).get(field)
+    return None
+
+
+def _extract_created_object_id(request: Dict[str, Any]) -> Optional[str]:
+    """Return the custom objectId that a Phase B create* request will mint.
+
+    These IDs don't appear in the live presentation yet (the create has not
+    been issued), but downstream requests in the same Phase B run target
+    them. We must NOT filter those downstream requests — that would orphan
+    cell `insertText` calls that depend on a `createTable` queued later in
+    the same Phase B batch sequence.
+    """
+    for kind in _OBJECT_CREATING_REQUEST_KINDS:
+        if kind in request:
+            return (request[kind] or {}).get("objectId")
     return None
 
 
@@ -598,12 +627,76 @@ async def _execute_slides_per_slide(
                 f"({slide_pos + 1}/{total_slides}) chunk {chunk_idx + 1}/{len(chunks)} "
                 f"({len(chunk)} requests)"
             )
-            await _run_with_transient_retry(
-                slides_service.presentations()
-                .batchUpdate(presentationId=presentation_id, body={"requests": chunk})
-                .execute,
-                label=label,
-            )
+            try:
+                await _run_with_transient_retry(
+                    slides_service.presentations()
+                    .batchUpdate(presentationId=presentation_id, body={"requests": chunk})
+                    .execute,
+                    label=label,
+                )
+            except HttpError as e:
+                # The Slides backend has a known pathology: certain content
+                # batches against custom layouts (notably multi-BODY two-column
+                # layouts) deterministically return HTTP 500 even when every
+                # individual request is valid. Sending each request in its
+                # own batchUpdate sidesteps that — and as a bonus, if a
+                # request is genuinely broken, the per-request error pinpoints
+                # which one. We only fall back on 5xx, not 4xx (the latter
+                # are real client errors that won't get better by splitting).
+                status = getattr(e, "status_code", None) or (
+                    getattr(e, "resp", None).status if getattr(e, "resp", None) else None
+                )
+                if status not in (500, 502, 503, 504):
+                    raise
+                logger.warning(
+                    f"[create_audit_presentation:{label}] Batch failed with HTTP {status} "
+                    f"after retries; falling back to per-request execution to isolate the "
+                    f"problem and work around the Slides backend's multi-request 500 pathology."
+                )
+                for req_idx, single_req in enumerate(chunk):
+                    sub_label = (
+                        f"slides.batchUpdate slide#{slide_idx + 1} "
+                        f"({slide_pos + 1}/{total_slides}) chunk {chunk_idx + 1}/{len(chunks)} "
+                        f"req {req_idx + 1}/{len(chunk)} [{next(iter(single_req.keys()))}]"
+                    )
+                    try:
+                        await _run_with_transient_retry(
+                            slides_service.presentations()
+                            .batchUpdate(
+                                presentationId=presentation_id,
+                                body={"requests": [single_req]},
+                            )
+                            .execute,
+                            label=sub_label,
+                        )
+                    except HttpError as sub_e:
+                        sub_status = getattr(sub_e, "status_code", None) or (
+                            getattr(sub_e, "resp", None).status
+                            if getattr(sub_e, "resp", None)
+                            else None
+                        )
+                        # Truthful diagnostic: dump the request that we're
+                        # giving up on so the user can fix or remove it.
+                        try:
+                            req_dump = json.dumps(single_req, ensure_ascii=False)[:1500]
+                        except Exception:
+                            req_dump = repr(single_req)[:1500]
+                        if sub_status in (500, 502, 503, 504):
+                            logger.error(
+                                f"[create_audit_presentation:{sub_label}] Slides API still "
+                                f"returns HTTP {sub_status} for this single request after "
+                                f"the per-batch retry budget. Skipping it so the rest of "
+                                f"the deck can complete. Request body: {req_dump}"
+                            )
+                            continue
+                        # 4xx and other errors are real bugs in the request
+                        # — surface them so they get fixed.
+                        logger.error(
+                            f"[create_audit_presentation:{sub_label}] Slides API rejected "
+                            f"this request with HTTP {sub_status}. Request body: {req_dump}"
+                        )
+                        raise
+                    await asyncio.sleep(INTER_BATCH_SLEEP_S)
             await asyncio.sleep(INTER_BATCH_SLEEP_S)
 
 
@@ -1144,6 +1237,19 @@ async def create_audit_presentation(
             label="slides.presentations.get (placeholder verification)",
         )
         existing_ids = _collect_existing_object_ids(verify_pres)
+        # Phase B will create more objects (tables, free shapes, images,
+        # sheets charts) with objectIds we minted client-side. Their
+        # dependent requests (e.g. cell `insertText` into a newly created
+        # table) target these IDs and would be wrongly filtered if we only
+        # consulted the live presentation. Pre-register every objectId
+        # that any queued create* request is about to mint.
+        will_be_created: set = set()
+        for _, reqs in per_slide_content:
+            for req in reqs:
+                created_id = _extract_created_object_id(req)
+                if created_id:
+                    will_be_created.add(created_id)
+        existing_ids |= will_be_created
         # Also remember the actual placeholders per slide so we can suggest a
         # remediation in the warning (which type/index DID materialize).
         verify_slide_placeholders: Dict[str, List[Dict[str, Any]]] = {}
