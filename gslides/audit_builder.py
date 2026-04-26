@@ -213,11 +213,19 @@ def _build_chart_addchart_request(
     )
 
     if chart_type in _BASIC_CHART_TYPES:
+        # Horizontal BAR charts have their value axis at the bottom and the
+        # category (domain) axis at the left — the opposite of every other
+        # basic chart. Series must target BOTTOM_AXIS or Sheets rejects the
+        # request with "Bar charts series may only target the BOTTOM_AXIS".
+        is_horizontal_bar = chart_type == "BAR"
+        domain_axis_position = "LEFT_AXIS" if is_horizontal_bar else "BOTTOM_AXIS"
+        value_axis_position = "BOTTOM_AXIS" if is_horizontal_bar else "LEFT_AXIS"
+
         axis: List[Dict[str, Any]] = []
         if chart_spec.get("domain_axis_title"):
-            axis.append({"position": "BOTTOM_AXIS", "title": chart_spec["domain_axis_title"]})
+            axis.append({"position": domain_axis_position, "title": chart_spec["domain_axis_title"]})
         if chart_spec.get("value_axis_title"):
-            axis.append({"position": "LEFT_AXIS", "title": chart_spec["value_axis_title"]})
+            axis.append({"position": value_axis_position, "title": chart_spec["value_axis_title"]})
 
         series_palette = style.get("series_colors") or []
         # COMBO charts require each series to specify its own type. Without
@@ -238,7 +246,7 @@ def _build_chart_addchart_request(
         for idx, src in enumerate(series_sources):
             series_entry: Dict[str, Any] = {
                 "series": {"sourceRange": {"sources": [src]}},
-                "targetAxis": "LEFT_AXIS",
+                "targetAxis": value_axis_position,
             }
             if per_series_types:
                 series_entry["type"] = per_series_types[idx]
