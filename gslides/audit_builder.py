@@ -538,6 +538,12 @@ async def create_audit_presentation(
         str: JSON string with presentation_id, presentation_url, slide_count, data_sheet_url,
         folder_id, message.
     """
+    if not isinstance(template_presentation_id, str) or not template_presentation_id.strip():
+        raise Exception(
+            "'template_presentation_id' is required and must be a non-empty Drive file ID "
+            "(the long token in the template's URL between '/d/' and '/edit')."
+        )
+    template_presentation_id = template_presentation_id.strip()
     if not isinstance(deck, dict):
         raise Exception("'deck' must be a JSON object with 'title' and 'slides'.")
     deck_title = (deck.get("title") or "").strip()
