@@ -616,6 +616,16 @@ async def _execute_slides_per_slide(
     """
     if not per_slide_requests:
         return
+    # Fail-fast retry budgets so the per-request fallback ALWAYS runs within
+    # the MCP transport's 60s timeout window. Worst-case math:
+    #   chunk: 2 attempts × (≈5s API + 1s sleep) ≈ 12s
+    #   fallback: N requests × 3 attempts × (≈5s API + ≤4s sleep) per request
+    # For typical slides with ≤10 content requests, total well under 60s.
+    # We deliberately do NOT use the generic 6-attempt budget (1+2+4+8+16+32
+    # = 63s of sleeps alone) which prevented the fallback from ever firing
+    # in practice.
+    chunk_max_attempts = 2
+    per_request_max_attempts = 3
     total_slides = len(per_slide_requests)
     for slide_pos, (slide_idx, slide_requests) in enumerate(per_slide_requests):
         if not slide_requests:
@@ -633,6 +643,7 @@ async def _execute_slides_per_slide(
                     .batchUpdate(presentationId=presentation_id, body={"requests": chunk})
                     .execute,
                     label=label,
+                    max_attempts=chunk_max_attempts,
                 )
             except HttpError as e:
                 # The Slides backend has a known pathology: certain content
@@ -668,6 +679,7 @@ async def _execute_slides_per_slide(
                             )
                             .execute,
                             label=sub_label,
+                            max_attempts=per_request_max_attempts,
                         )
                     except HttpError as sub_e:
                         sub_status = getattr(sub_e, "status_code", None) or (
