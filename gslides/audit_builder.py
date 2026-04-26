@@ -858,26 +858,55 @@ async def create_audit_presentation(
         },
         "slides": [
           {"layout": "TITLE", "fields": {"title": "...", "subtitle": "..."}},
-          {"layout": "TITLE_AND_BODY", "fields": {"title": "...", "body": "..."},
+          # Inline `**bold**` runs are parsed and rendered as bold; emojis pass through.
+          # Use `\\**` to insert a literal `**`. UTF-16 indexing is handled correctly
+          # so bold ranges align around 4-byte glyphs (emojis).
+          {"layout": "TITLE_AND_BODY",
+           "fields": {"title": "Synthèse",
+                      "body": "📊 Score **59/100**.\\n\\n🚀 Plan : **+25 %** en 12 mois."},
+           # Per-field text style overrides. Each value is a Slides API TextStyle dict.
+           # Use this to pin font/size on placeholders that don't inherit cleanly from
+           # the master (notably the right column on Two Columns — see below).
+           "styles": {"body": {"fontFamily": "Inter",
+                                "fontSize": {"magnitude": 12, "unit": "PT"}}},
            "speaker_notes": "..."},
           # Two-column layout: pass `body` as a list. Item 0 fills BODY index 0
-          # (left column), item 1 fills BODY index 1 (right column), etc.
-          {"layout": "Title + Two Columns", "fields": {
-              "title": "Avant / Après",
-              "body": ["Avant: ...", "Après: ..."]}},
-          # PICTURE placeholder ("espace réservé image"): fill by ordinal
-          # index of the PICTURE placeholders in the layout. Each item is
-          # either a URL string or {"url": "...", "method": "CENTER_INSIDE"|"CENTER_CROP"}.
-          {"layout": "Cover", "fields": {"title": "Pré-audit SEO"},
+          # (left column), item 1 fills BODY index 1 (right column). The right
+          # column renders as a free-floating TEXT_BOX overlay (multi-BODY ghost-bug
+          # workaround) and does NOT inherit the master's body style — always pass
+          # an explicit `styles.body[1]` to keep both columns visually consistent.
+          {"layout": "Title + Two Columns",
+           "fields": {"title": "Avant / Après",
+                      "body": ["**Avant** : ...", "**Après** : ..."]},
+           "styles": {"body": [None, {"fontFamily": "Inter",
+                                       "fontSize": {"magnitude": 12, "unit": "PT"}}]}},
+          # PICTURE placeholder ("espace réservé image"): fill by ordinal index of
+          # the PICTURE placeholders in the layout. Each item is either a URL string
+          # or {"url": "...", "method": "CENTER_INSIDE"|"CENTER_CROP"}. The layout
+          # MUST actually expose a PICTURE placeholder — verify in the build log
+          # ("Copy layout placeholders" line). PICTURE placeholders may be defined
+          # as either `shape` OR `image` PageElements; both are detected.
+          {"layout": "Cover",
            "image_placeholders": ["https://example.com/laptop-mockup.png"]},
+          # Free-floating image fallback when the layout has no PICTURE placeholder.
+          # `position` is in points (default page is 720x405 PT). Drag-and-tune once
+          # in the Slides editor, then bake the X/Y/W/H back into the JSON.
+          {"layout": "Cover",
+           "image": {"url": "https://example.com/visual.png",
+                     "position": {"x": 25, "y": 70, "w": 350, "h": 230}}},
           {"layout": "BLANK", "title": "Free title", "table": {
               "headers": ["Metric", "Value"], "rows": [["...", "..."]]}},
-          {"layout": "BLANK", "title": "Scores", "chart": {
+          # Half-slide chart on a "Title + Chart + Body" custom layout: place the
+          # chart on the right (x:380) so it doesn't overlap the body placeholder
+          # on the left. For full-width "Title + Chart" layouts, use x:60, w:600.
+          {"layout": "Title + Chart + Body",
+           "fields": {"title": "Scores", "body": "Lecture : ..."},
+           "chart": {
               "type": "COLUMN", "title": "Scores par pilier",
               "data": {"headers": ["Pilier", "Score"],
-                       "rows": [["Technique", 90], ["Contenu", 64]]}}},
+                       "rows": [["Technique", 90], ["Contenu", 64]]},
+              "position": {"x": 380, "y": 110, "w": 300, "h": 250}}},
           {"layout": "SECTION_HEADER", "fields": {"title": "Recommandations"}},
-          {"layout": "BLANK", "title": "Capture", "image": {"url": "https://..."}}
         ]
       }
 

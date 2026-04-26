@@ -853,6 +853,8 @@ cp .env.oauth21 .env
 Designed for workflows (n8n, custom scripts, agents) that already produce structured audit data
 and need to ship it as a branded Google Slides deck without writing any Slides API code.
 
+> 💡 **Driving this from an LLM agent?** A copy-pasteable system prompt that locks the agent to the canonical webloom layout vocabulary and JSON conventions lives at [`gslides/AGENT_SYSTEM_PROMPT.md`](gslides/AGENT_SYSTEM_PROMPT.md). Paste it into Claude / OpenAI / Gemini / n8n's *System Message* and the agent will reliably emit valid `create_audit_presentation` payloads.
+
 One MCP call → whole deck. No iteration. The tool handles template copying, hidden data sheet
 creation, native Sheets chart generation, slide layout, speaker notes, folder placement, and
 rollback on failure. Slides API requests are chunked internally to stay under per-batch limits;
@@ -885,78 +887,74 @@ fonts. The template is **never modified**.
   },
   "slides": [
     {
-      "layout": "TITLE",
-      "fields": { "title": "Pré-audit SEO", "subtitle": "edaa.fr — Avril 2026" }
+      "layout": "Cover",
+      "image_placeholders": [
+        "https://drive.google.com/uc?export=view&id=LAPTOP_FILE_ID"
+      ],
+      "speaker_notes": "Slide d'ouverture. Visuel intégré au layout."
     },
     {
-      "layout": "TITLE_AND_BODY",
+      "layout": "Section",
+      "fields": { "title": "Pré-audit SEO — edaa.fr", "subtitle": "Avril 2026 · webloom" }
+    },
+    {
+      "layout": "Title + Body",
       "fields": {
-        "title": "Synthèse exécutive",
-        "body": "Le site edaa.fr affiche un score global SEO de 59..."
+        "title": "Synthèse en 30 secondes",
+        "body": "📊 edaa.fr affiche un **score SEO global de 59/100**.\n\n📉 Trafic : **8 847 sessions/mois** (-36,1 % YoY).\n\n🚀 4 chantiers prioritaires → **+25 % de trafic en 12 mois** pour **20 000 €** investis."
       },
-      "speaker_notes": "Insister sur l'écart pilier GEO/IA (10/100)."
+      "speaker_notes": "Slide la plus importante du deck."
     },
     {
-      "layout": "BLANK",
-      "title": "KPIs principaux",
-      "table": {
-        "headers": ["Métrique", "Valeur"],
-        "rows": [
-          ["Score global /100", "59"],
-          ["Trafic mensuel (visites)", "8847"],
-          ["CA mensuel estimé (€)", "176 940"],
-          ["Évolution trafic 12 mois", "-36.1%"]
-        ],
-        "position": { "x": 50, "y": 100, "w": 600, "h": 250 }
+      "layout": "Two Columns",
+      "fields": {
+        "title": "Avant / Après — 12 mois",
+        "body": [
+          "📍 **AVANT** (T0)\n\n• Score : **59/100**\n• Trafic : **8 847** /mois\n• CA : **176 940 €** /mois",
+          "🎯 **APRÈS** (T+12)\n\n• Score : **80/100**\n• Trafic : **11 000** /mois\n• CA : **220 000 €** /mois"
+        ]
+      },
+      "styles": {
+        "body": [null, { "fontFamily": "Inter", "fontSize": { "magnitude": 12, "unit": "PT" } }]
       }
     },
     {
-      "layout": "BLANK",
-      "title": "Scores par pilier",
+      "layout": "Title + Chart + Body",
+      "fields": {
+        "title": "Scores SEO par pilier",
+        "body": "📖 **Lecture**\n\n• 🛠️ Technique : **90/100**\n• ✍️ Contenu : **64/100**\n• 🔗 Backlinks : **57/100**\n• 🤖 GEO/IA : **10/100**"
+      },
+      "styles": {
+        "body": { "fontFamily": "Inter", "fontSize": { "magnitude": 12, "unit": "PT" } }
+      },
       "chart": {
         "type": "COLUMN",
-        "title": "Scores SEO par pilier (/100)",
+        "title": "Scores /100 par pilier",
         "value_axis_title": "Score",
         "data": {
           "headers": ["Pilier", "Score"],
-          "rows": [
-            ["Technique & Performance", 90],
-            ["Contenu", 64],
-            ["Backlinks", 57],
-            ["GEO / Visibilité IA", 10]
-          ]
+          "rows": [["Technique", 90], ["Contenu", 64], ["Backlinks", 57], ["GEO / IA", 10]]
         },
-        "position": { "x": 60, "y": 100, "w": 600, "h": 280 }
+        "series_colors": ["#1DB954"],
+        "position": { "x": 380, "y": 110, "w": 300, "h": 250 }
       }
     },
     {
-      "layout": "SECTION_HEADER",
-      "fields": { "title": "Recommandations" }
-    },
-    {
-      "layout": "Title + Two Columns",
-      "fields": {
-        "title": "Avant / Après",
-        "body": [
-          "Avant : score 59/100, trafic -36% YoY, GEO 10/100.",
-          "Après : objectif 80/100, +25% trafic, GEO 60/100."
-        ]
+      "layout": "Title + Table",
+      "fields": { "title": "KPIs principaux" },
+      "table": {
+        "headers": ["Métrique", "Actuelle", "Cible 12m", "Δ"],
+        "rows": [
+          ["Score SEO /100", "59", "80", "+36 %"],
+          ["Trafic mensuel", "8 847", "11 000", "+24 %"],
+          ["CA mensuel (€)", "176 940", "220 000", "+24 %"]
+        ],
+        "position": { "x": 40, "y": 95, "w": 640, "h": 280 }
       }
     },
     {
-      "layout": "Cover",
-      "fields": { "title": "Pré-audit SEO" },
-      "image_placeholders": [
-        "https://drive.google.com/uc?export=view&id=LAPTOP_FILE_ID"
-      ]
-    },
-    {
-      "layout": "BLANK",
-      "title": "Capture homepage",
-      "image": {
-        "url": "https://drive.google.com/uc?export=view&id=FILE_ID",
-        "position": { "x": 60, "y": 100, "w": 600, "h": 280 }
-      }
+      "layout": "Section",
+      "fields": { "title": "Merci.", "subtitle": "francois@webloom.fr" }
     }
   ]
 }
@@ -968,18 +966,27 @@ fonts. The template is **never modified**.
 |---|---|
 | `layout` | Predefined layout name (`TITLE`, `TITLE_AND_BODY`, `BLANK`, `SECTION_HEADER`, `BIG_NUMBER`, ...) or a custom template layout's display name. |
 | `fields.title` / `fields.subtitle` | Fills the single TITLE/SUBTITLE placeholder. |
-| `fields.body` | Fills the BODY placeholder. Pass a **string** for a single-body layout, or a **list of strings** for layouts that expose multiple BODY placeholders (e.g. two-column layouts). Item `i` fills the BODY at layout index `i`. |
-| `image_placeholders` | List of items targeting **PICTURE placeholders** ("espace réservé image") in the layout. Each item is either a URL string or `{"url": "...", "method": "CENTER_INSIDE"\|"CENTER_CROP"}`. Item `i` fills the PICTURE at layout index `i`. |
+| `fields.body` | Fills the BODY placeholder. Pass a **string** for a single-body layout, or a **list of strings** for layouts that expose multiple BODY placeholders (e.g. two-column layouts). Item `i` fills the BODY at layout index `i`. Inline `**bold**` markers are parsed and rendered as bold runs; emojis pass through as-is (use `\**` to escape a literal `**`). |
+| `styles` | Per-field text style overrides. Each value is a Slides API `TextStyle` dict (`{fontFamily, fontSize:{magnitude,unit}, bold, italic, foregroundColor, ...}`). For two-column layouts, `styles.body` may be an **array** aligned with the body texts; `null` keeps the placeholder default for that slot. **Always set `styles.body[1]` on Two Columns layouts** — the right column renders as an overlay and won't inherit the master style otherwise. |
+| `image_placeholders` | List of items targeting **PICTURE placeholders** ("espace réservé image") in the layout. Each item is either a URL string or `{"url": "...", "method": "CENTER_INSIDE"\|"CENTER_CROP"}`. Item `i` fills the PICTURE at layout index `i`. PICTURE placeholders defined as either `shape` or `image` page elements are both detected. |
 | `title` (top-level, on `BLANK`) | Adds a free-floating title text box. |
 | `table` | `{headers, rows, position?, header_style?, body_style?}` — creates a real `Table` element you can re-style by hand later. |
-| `chart` | `{type, title?, data:{headers, rows}, position?, value_axis_title?, domain_axis_title?, legend_position?, width_pixels?, height_pixels?}` — becomes a native Sheets chart embedded as `LINKED`, so refreshing the Sheet refreshes the deck. |
-| `image` | `{url, position?}` — free-floating image, **not** a placeholder. Must be a publicly accessible URL. |
-| `text_boxes` | List of `{text, position?, style?, alignment?}` for free placement. |
-| `speaker_notes` | Plain text added to the slide's notes page. |
+| `chart` | `{type, title?, data:{headers, rows}, position?, value_axis_title?, domain_axis_title?, legend_position?, series_colors?, stacked_type?, series_types?}` — becomes a native Sheets chart embedded as `LINKED`, so refreshing the Sheet refreshes the deck. |
+| `image` | `{url, position?}` — free-floating image, **not** a placeholder. Must be a publicly accessible URL. Use this when the layout has no PICTURE placeholder, or when you want pixel control. |
+| `text_boxes` | List of `{text, position?, style?, alignment?}` for free placement. `alignment` ∈ `START` \| `CENTER` \| `END` \| `JUSTIFIED`. |
+| `speaker_notes` | Plain text added to the slide's notes page (no markdown). |
 
-**Supported chart types**: `BAR`, `COLUMN`, `LINE`, `AREA`, `SCATTER`, `COMBO`, `STEPPED_AREA`, `PIE`, `DOUGHNUT`. Convention: column 0 of `data.rows` is the X axis (or pie domain); remaining columns are series.
+**Supported chart types**: `BAR`, `COLUMN`, `LINE`, `AREA`, `SCATTER`, `COMBO`, `STEPPED_AREA`, `PIE`, `DOUGHNUT`. Convention: column 0 of `data.rows` is the X axis (or pie domain); remaining columns are series. Numbers should be numeric (not quoted strings) so Sheets axes auto-format.
 
 Coordinates use **points (PT)**. The default page is 720 × 405 PT (standard widescreen).
+
+**Chart positioning recipes** (default 720×405 slide, title strip occupies y:0–90):
+
+| Layout context | Recommended `position` |
+|---|---|
+| `Title + Chart + Body` (body on left) | `{ "x": 380, "y": 110, "w": 300, "h": 250 }` (chart on right) |
+| `Title + Chart + Body` (body on right) | `{ "x": 40, "y": 110, "w": 300, "h": 250 }` (chart on left) |
+| `Title + Chart` (chart only, full width) | `{ "x": 60, "y": 110, "w": 600, "h": 270 }` |
 
 #### Chart styling (brand colors, fonts, background)
 
@@ -1016,6 +1023,47 @@ Embedded Sheets charts do **not** automatically inherit your Slides template's t
 | `title_text_format` | All chart types | `{bold, italic, font_size, font_family, foreground_color}` — all keys optional. |
 | `legend_position` | All chart types | `BOTTOM_LEGEND` (default), `LEFT_LEGEND`, `RIGHT_LEGEND`, `TOP_LEGEND`, `NO_LEGEND`. |
 | `stacked_type` | Bar / Column / Area only | `NONE`, `STACKED`, `PERCENT_STACKED`. Ignored for other chart types. |
+
+#### Authoring tips & gotchas
+
+These are battle-tested rules captured from real-world deck builds. They apply to whether you call the tool from a chatbot, an n8n workflow, or by hand.
+
+**1. Bold and emojis in `body` text.** Wrap any segment with `**…**` to render it bold; emojis (📊 🚀 🎯 …) pass through transparently. UTF-16 indexing is handled internally so bold ranges align correctly around 4-byte glyphs.
+
+```json
+"body": "📊 Score : **59/100**.\n\n🚀 Plan : **+25 %** en 12 mois."
+```
+
+To insert a literal `**`, escape it as `\**`.
+
+**2. Two Columns layouts: always pass an explicit `styles.body[1]`.** When a layout exposes two BODY placeholders, the second is rendered as a free-floating `TEXT_BOX` overlay (this works around a known Slides API ghost-bug with multi-BODY placeholders). That overlay does **not** inherit the master text style, so without an explicit style the right column visually drifts from the left. Use `null` as the first array element to keep the left column on its placeholder default:
+
+```json
+"styles": {
+  "body": [null, { "fontFamily": "Inter", "fontSize": { "magnitude": 12, "unit": "PT" } }]
+}
+```
+
+Use Two Columns sparingly — single-column slides with a strong `body` paragraph are usually more readable. Reserve two columns for genuine before/after, do/don't, or option A/B comparisons.
+
+**3. PICTURE placeholders ("espace réservé image").** `image_placeholders` only works if the *layout* (not the slide instance) actually exposes one or more PICTURE placeholders. To add one in the editor: **Slide → Edit theme → select the layout → Insert → Placeholder → Image → Apply to layout**. The build log prints, for every slide, which placeholders were detected (`Copy layout placeholders: TITLE x1, BODY x1, PICTURE x1`). If `PICTURE` is missing there, fall back to a free-floating `image` block:
+
+```json
+{ "layout": "Cover",
+  "image": { "url": "https://…", "position": { "x": 25, "y": 70, "w": 350, "h": 230 } } }
+```
+
+PICTURE placeholders can be defined as either `shape` or `image` PageElements in the template — both are detected automatically.
+
+**4. Charts must clear their neighbouring placeholders.** Charts are placed by absolute `position` and do **not** auto-flow inside a column. If you put a chart on a `Title + Chart + Body` slide without `position`, it will overlap the body text. Use the recipes in the table above, or drag-and-tune once in the Slides editor and bake the resulting `x/y/w/h` back into the JSON.
+
+**5. Brand your charts.** Embedded Sheets charts inherit Sheets' default palette, not your Slides theme. Set `deck.chart_defaults` once (series colors, font, title style, legend position), then override per chart only when needed. See the [Chart styling](#chart-styling-brand-colors-fonts-background) section above.
+
+**6. Numbers stay numeric.** In `chart.data.rows`, pass numbers as numbers (`90`), not strings (`"90"`), so Sheets formats axes correctly. In `table.rows`, strings are fine — tables are textual.
+
+**7. Speaker notes are plain text.** No markdown, no inline styling. They go straight into the slide's notes page.
+
+**8. Quotas.** The Slides API enforces ~60 write requests per minute per user. The tool retries transient `429`s automatically; if you regenerate decks frequently from the same project, request a quota bump in Google Cloud Console.
 
 #### Example call
 
