@@ -24,6 +24,8 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from googleapiclient.errors import HttpError
+
 from auth.service_decorator import require_multiple_services
 from core.server import server
 from core.utils import handle_http_errors
@@ -32,10 +34,21 @@ from gslides import _builders as B
 
 logger = logging.getLogger(__name__)
 
-# Google's `slides.batchUpdate` becomes flaky beyond ~500 requests / 2 MB. 400 leaves headroom.
-MAX_REQUESTS_PER_BATCH = 400
+# Slides `batchUpdate` is sensitive to large request lists — placeholder mappings
+# and createSlide+text inserts in the same batch can trigger transient 500s when
+# the batch grows. 75 requests per batch keeps each call well under Google's
+# soft limits and means a single transient failure only forces a retry of a
+# small slice of work.
+MAX_REQUESTS_PER_BATCH = 75
 # Per-call addChart batches stay comfortably under Sheets quota.
 MAX_CHARTS_PER_SHEETS_BATCH = 20
+# Inter-batch pause to avoid bursting Slides/Sheets quota over many chunks.
+INTER_BATCH_SLEEP_S = 0.15
+# Per-batch retry policy. Total worst-case wait per batch ≈ 1+2+4+8+16+32 = 63s.
+# Transient Slides 500s nearly always clear within this window.
+BATCH_MAX_ATTEMPTS = 6
+BATCH_BASE_DELAY_S = 1.0
+BATCH_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
 _BASIC_CHART_TYPES = {"BAR", "COLUMN", "LINE", "AREA", "SCATTER", "COMBO", "STEPPED_AREA"}
 _PIE_CHART_TYPES = {"PIE", "DOUGHNUT"}
@@ -93,6 +106,45 @@ def _effective_chart_style(
     return style
 
 
+async def _run_with_transient_retry(
+    call,
+    label: str,
+    max_attempts: int = BATCH_MAX_ATTEMPTS,
+    base_delay: float = BATCH_BASE_DELAY_S,
+):
+    """Execute `call` (a zero-arg synchronous callable) on a worker thread, retrying
+    transient Google API errors locally with exponential backoff.
+
+    This is the per-batch retry layer used inside the audit tool. It absorbs
+    transient 5xx and 429 responses on a single batch so the OUTER tool-level
+    retry never has to restart the whole presentation build (which would re-copy
+    the template, re-create the data sheet, and re-render every slide).
+
+    Non-transient errors (400, 401, 403, 404, etc.) are re-raised immediately.
+    After exhausting `max_attempts` on transient errors, the last HttpError is
+    re-raised so the caller can surface a clean message.
+    """
+    last_error: Optional[HttpError] = None
+    for attempt in range(max_attempts):
+        try:
+            return await asyncio.to_thread(call)
+        except HttpError as err:
+            status = getattr(err.resp, "status", None)
+            if status not in BATCH_RETRYABLE_STATUSES:
+                raise
+            last_error = err
+            if attempt >= max_attempts - 1:
+                break
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                f"[create_audit_presentation:{label}] Transient HTTP {status} on "
+                f"attempt {attempt + 1}/{max_attempts}. Retrying in {delay:.1f}s..."
+            )
+            await asyncio.sleep(delay)
+    assert last_error is not None
+    raise last_error
+
+
 # -----------------------------
 # Drive / template helpers
 # -----------------------------
@@ -101,7 +153,7 @@ async def _copy_template(
 ) -> Dict[str, str]:
     """Copy a template Slides file. Returns the new file's metadata."""
     body = {"name": new_title}
-    return await asyncio.to_thread(
+    return await _run_with_transient_retry(
         drive_service.files()
         .copy(
             fileId=template_presentation_id,
@@ -109,7 +161,8 @@ async def _copy_template(
             fields="id, name, parents, webViewLink",
             supportsAllDrives=True,
         )
-        .execute
+        .execute,
+        label="drive.files.copy (template)",
     )
 
 
@@ -326,8 +379,9 @@ async def _create_data_sheet_and_charts(
         "properties": {"title": f"{title} - data"},
         "sheets": [{"properties": {"title": t}} for t in sheet_titles],
     }
-    spreadsheet = await asyncio.to_thread(
-        sheets_service.spreadsheets().create(body=body).execute
+    spreadsheet = await _run_with_transient_retry(
+        sheets_service.spreadsheets().create(body=body).execute,
+        label="sheets.spreadsheets.create",
     )
     spreadsheet_id = spreadsheet["spreadsheetId"]
     spreadsheet_url = spreadsheet.get("spreadsheetUrl")
@@ -367,14 +421,15 @@ async def _create_data_sheet_and_charts(
         value_ranges.append({"range": a1_range, "values": grid})
         geometry.append((i, n_rows, n_cols))
 
-    await asyncio.to_thread(
+    await _run_with_transient_retry(
         sheets_service.spreadsheets()
         .values()
         .batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"valueInputOption": "USER_ENTERED", "data": value_ranges},
         )
-        .execute
+        .execute,
+        label="sheets.values.batchUpdate",
     )
 
     # Phase 2: addChart, chunked to stay under Sheets per-batch limits.
@@ -392,11 +447,12 @@ async def _create_data_sheet_and_charts(
     chart_ids: List[Tuple[str, int]] = []
     chunks = B.chunk_requests(addchart_requests, MAX_CHARTS_PER_SHEETS_BATCH)
     chunk_offset = 0
-    for chunk in chunks:
-        response = await asyncio.to_thread(
+    for chunk_idx, chunk in enumerate(chunks):
+        response = await _run_with_transient_retry(
             sheets_service.spreadsheets()
             .batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": chunk})
-            .execute
+            .execute,
+            label=f"sheets.addChart batch {chunk_idx + 1}/{len(chunks)} ({len(chunk)} charts)",
         )
         replies = response.get("replies", [])
         for j, reply in enumerate(replies):
@@ -405,6 +461,8 @@ async def _create_data_sheet_and_charts(
             chart_uid = chart_specs[chunk_offset + j].get("_uid", f"chart_{chunk_offset + j}")
             chart_ids.append((chart_uid, reply["addChart"]["chart"]["chartId"]))
         chunk_offset += len(chunk)
+        if chunk_idx < len(chunks) - 1:
+            await asyncio.sleep(INTER_BATCH_SLEEP_S)
 
     sheet_meta = {
         "spreadsheet_id": spreadsheet_id,
@@ -419,32 +477,45 @@ async def _create_data_sheet_and_charts(
 # -----------------------------
 async def _strip_existing_slides(slides_service, presentation_id: str) -> None:
     """Delete every slide currently in the (just-copied) presentation."""
-    presentation = await asyncio.to_thread(
-        slides_service.presentations().get(presentationId=presentation_id).execute
+    presentation = await _run_with_transient_retry(
+        slides_service.presentations().get(presentationId=presentation_id).execute,
+        label="slides.presentations.get (strip)",
     )
     slides = presentation.get("slides", []) or []
     if not slides:
         return
     requests = [{"deleteObject": {"objectId": s["objectId"]}} for s in slides]
-    await asyncio.to_thread(
+    await _run_with_transient_retry(
         slides_service.presentations()
         .batchUpdate(presentationId=presentation_id, body={"requests": requests})
-        .execute
+        .execute,
+        label="slides.batchUpdate (strip existing slides)",
     )
 
 
 async def _execute_slides_batches(
     slides_service, presentation_id: str, requests: List[Dict[str, Any]]
 ) -> None:
-    """Run a flat list of Slides requests in chunks of MAX_REQUESTS_PER_BATCH."""
+    """Run a flat list of Slides requests in chunks of MAX_REQUESTS_PER_BATCH.
+
+    Each chunk has its own transient-error retry layer with exponential backoff,
+    so a single 500/503 on chunk N does not abort the whole tool — only that
+    chunk is retried. Chunks are paced by INTER_BATCH_SLEEP_S to avoid 429s on
+    very large decks.
+    """
     if not requests:
         return
-    for chunk in B.chunk_requests(requests, MAX_REQUESTS_PER_BATCH):
-        await asyncio.to_thread(
+    chunks = B.chunk_requests(requests, MAX_REQUESTS_PER_BATCH)
+    total = len(chunks)
+    for chunk_idx, chunk in enumerate(chunks):
+        await _run_with_transient_retry(
             slides_service.presentations()
             .batchUpdate(presentationId=presentation_id, body={"requests": chunk})
-            .execute
+            .execute,
+            label=f"slides.batchUpdate {chunk_idx + 1}/{total} ({len(chunk)} requests)",
         )
+        if chunk_idx < total - 1:
+            await asyncio.sleep(INTER_BATCH_SLEEP_S)
 
 
 def _annotate_chart_uids(deck: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -679,8 +750,9 @@ async def create_audit_presentation(
             chart_id_by_uid = dict(chart_pairs)
 
         # 7) Build all slide-creation requests in one big list (we'll chunk for execution).
-        presentation = await asyncio.to_thread(
-            slides_service.presentations().get(presentationId=presentation_id).execute
+        presentation = await _run_with_transient_retry(
+            slides_service.presentations().get(presentationId=presentation_id).execute,
+            label="slides.presentations.get (layout discovery)",
         )
 
         # When keeping template slides, append generated slides at the end so the boilerplate
@@ -724,8 +796,9 @@ async def create_audit_presentation(
             (i, s["speaker_notes"]) for i, s in enumerate(slides) if s.get("speaker_notes")
         ]
         if notes_specs:
-            updated_presentation = await asyncio.to_thread(
-                slides_service.presentations().get(presentationId=presentation_id).execute
+            updated_presentation = await _run_with_transient_retry(
+                slides_service.presentations().get(presentationId=presentation_id).execute,
+                label="slides.presentations.get (notes pass)",
             )
             slide_objs = updated_presentation.get("slides", []) or []
             notes_requests: List[Dict[str, Any]] = []
