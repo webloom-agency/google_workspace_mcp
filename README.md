@@ -1065,6 +1065,12 @@ PICTURE placeholders can be defined as either `shape` or `image` PageElements in
 
 **8. Quotas.** The Slides API enforces ~60 write requests per minute per user. The tool retries transient `429`s automatically; if you regenerate decks frequently from the same project, request a quota bump in Google Cloud Console.
 
+**9. Long builds & MCP client timeouts.** Large decks (~30+ slides, especially with charts and tables) take 60–180 seconds to build because Google's `slides.batchUpdate` is rate-limited and `createSlide` against custom layouts must run sequentially to stay reliable. The tool emits live MCP `progress` notifications during the build (Phase A creation, Phase B content, notes pass) so the streaming-HTTP connection stays warm and the client can show a real progress bar instead of timing out and retrying. **If your MCP client retries the call mid-build, it will start a second parallel build that competes for the same per-user write quota and triggers a 429 cascade.** If you control the client, raise its tool-call timeout to at least 300 s for 30+ slide decks (or 600 s for 100-slide decks). Tested clients:
+
+- **Cursor**: bump the `mcp.tools.timeout` setting (default is usually too low for long builds).
+- **Claude Desktop**: edit `claude_desktop_config.json` and add a generous `timeout` to the MCP server entry.
+- **n8n / cloud agents**: ensure the workflow's HTTP timeout for the MCP step is generous (≥ 300 s).
+
 #### Example call
 
 ```json

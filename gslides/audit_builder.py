@@ -34,27 +34,77 @@ from gslides import _builders as B
 
 logger = logging.getLogger(__name__)
 
+
+async def _report_progress(
+    progress: float,
+    total: Optional[float] = None,
+    message: Optional[str] = None,
+) -> None:
+    """Best-effort MCP progress notification.
+
+    Sends a `notifications/progress` frame to the calling MCP client over
+    the streaming HTTP transport. This serves two purposes:
+
+    1) **Keeps the connection warm.** Long-running tools (a 100-slide deck
+       can take 2-3 minutes) otherwise produce no traffic for minutes,
+       which leads MCP clients to perceive the call as hung and *retry it*
+       — and a duplicate retry triggers a second full build that competes
+       with the first for the per-user 60 writes/min Slides quota,
+       producing 429 cascades. Periodic progress frames prevent that.
+
+    2) **Informs the user.** Most MCP clients (Cursor, Claude Desktop,
+       n8n) surface progress messages live so the user can watch the
+       build advance instead of staring at a frozen spinner.
+
+    Failures are swallowed: progress is non-essential and we never want a
+    notification hiccup to abort a perfectly good build.
+    """
+    try:
+        from fastmcp.server.dependencies import get_context
+
+        ctx = get_context()
+        if ctx is None:
+            return
+        report = getattr(ctx, "report_progress", None)
+        if report is None:
+            return
+        kwargs: Dict[str, Any] = {"progress": progress}
+        if total is not None:
+            kwargs["total"] = total
+        if message is not None:
+            kwargs["message"] = message
+        await report(**kwargs)
+    except Exception:
+        pass
+
 # Slides `batchUpdate` becomes unreliable when many `createSlide` calls are
 # stacked in one batch alongside dependent `insertText` / `createTable` /
 # `replaceImage` requests — Google's backend regularly returns deterministic
 # HTTP 500s on such mixed batches for decks of ~25+ slides. We therefore split
 # the build into two homogeneous phases (creation, then content), GROUP CONTENT
-# REQUESTS PER SLIDE (so a single batch never spans multiple slides), and cap
-# batch size aggressively. 10 requests per batch is conservative but rock-solid
-# even for 100-slide decks against custom-layout templates.
-MAX_REQUESTS_PER_BATCH = 10
+# REQUESTS PER SLIDE (so a single batch never spans multiple slides), and use a
+# moderate batch cap. 50 is a sweet spot: large enough that a typical 32-slide
+# deck collapses Phase B from ~75 batches (chunk=10) to ~32 batches (one per
+# slide in most cases), small enough to stay well below Slides' 500-request
+# hard cap and to keep retry costs bounded. The "per-slide homogeneity" rule
+# is what actually prevents the multi-request HTTP 500 pathology — chunk size
+# is just a knob for round-trip economy. The per-request fallback in
+# `_execute_slides_per_slide` will still bisect any batch the Slides backend
+# rejects, so larger chunks never compromise correctness.
+MAX_REQUESTS_PER_BATCH = 50
 # Per-call addChart batches stay comfortably under Sheets quota.
 MAX_CHARTS_PER_SHEETS_BATCH = 20
 # Inter-batch pause to avoid bursting Slides/Sheets quota over many chunks.
 # Google enforces "Write requests per minute per user" = 60 (default) on
-# slides.googleapis.com. A typical 33-slide deck issues ~66 writes (one
-# createSlide per slide in Phase A, one batchUpdate per slide in Phase B).
-# 0.3s pacing → ~66 writes spread over ~52s end-to-end, averaging well
-# below the per-minute cap. If we hit it on the very last writes, the
-# smart 429 backoff in `_run_with_transient_retry` (5s base, exponential)
-# absorbs it cleanly. Larger decks (>60 slides) may still need a quota
-# bump from Google Cloud Console; pacing alone can't widen the ceiling.
-INTER_BATCH_SLEEP_S = 0.3
+# slides.googleapis.com. With chunk=50 a typical 32-slide deck issues
+# ~32 (Phase A, one createSlide per call) + ~32 (Phase B, one per slide)
+# + 1-2 (notes pass, batched) ≈ 66 writes total. 0.15s pacing keeps us
+# under the per-minute ceiling while shaving ~10s off the wall clock vs
+# the previous 0.3s pace. If we still hit a 429, the smart backoff in
+# `_run_with_transient_retry` (5s base, exponential) absorbs it cleanly.
+# Larger decks (>80 slides) may still need a quota bump from Google Cloud
+# Console; pacing alone can't widen the ceiling.
+INTER_BATCH_SLEEP_S = 0.15
 # Per-batch retry policy. Total worst-case wait per batch ≈ 1+2+4+8+16+32 = 63s.
 # Transient Slides 500s nearly always clear within this window.
 BATCH_MAX_ATTEMPTS = 6
@@ -647,6 +697,7 @@ async def _execute_slides_per_slide(
     slides_service,
     presentation_id: str,
     per_slide_requests: List[Tuple[int, List[Dict[str, Any]]]],
+    on_slide_done: Optional[Any] = None,
 ) -> None:
     """Run Slides content requests one slide at a time.
 
@@ -675,6 +726,11 @@ async def _execute_slides_per_slide(
     total_slides = len(per_slide_requests)
     for slide_pos, (slide_idx, slide_requests) in enumerate(per_slide_requests):
         if not slide_requests:
+            if on_slide_done is not None:
+                try:
+                    await on_slide_done(slide_pos + 1, total_slides)
+                except Exception:
+                    pass
             continue
         chunks = B.chunk_requests(slide_requests, MAX_REQUESTS_PER_BATCH)
         for chunk_idx, chunk in enumerate(chunks):
@@ -756,6 +812,11 @@ async def _execute_slides_per_slide(
                         raise
                     await asyncio.sleep(INTER_BATCH_SLEEP_S)
             await asyncio.sleep(INTER_BATCH_SLEEP_S)
+        if on_slide_done is not None:
+            try:
+                await on_slide_done(slide_pos + 1, total_slides)
+            except Exception:
+                pass
 
 
 async def _execute_slides_sequentially(
@@ -763,6 +824,7 @@ async def _execute_slides_sequentially(
     presentation_id: str,
     requests: List[Dict[str, Any]],
     label_prefix: str,
+    on_step_done: Optional[Any] = None,
 ) -> None:
     """Run each Slides request as its own `batchUpdate` call.
 
@@ -788,6 +850,11 @@ async def _execute_slides_sequentially(
             .execute,
             label=f"{label_prefix} {i + 1}/{total}",
         )
+        if on_step_done is not None:
+            try:
+                await on_step_done(i + 1, total)
+            except Exception:
+                pass
         if i < total - 1:
             await asyncio.sleep(INTER_BATCH_SLEEP_S)
 
@@ -962,6 +1029,11 @@ async def create_audit_presentation(
     logger.info(
         f"[create_audit_presentation] Email: '{user_google_email}', Template: "
         f"{template_presentation_id}, Deck title: '{deck_title}', Slides: {len(slides)}"
+    )
+    await _report_progress(
+        progress=0,
+        total=100,
+        message=f"Starting build of {len(slides)} slide(s)…",
     )
 
     # 0) Pre-flight: read the TEMPLATE's layouts directly and validate every
@@ -1153,6 +1225,11 @@ async def create_audit_presentation(
             f"[create_audit_presentation] Copy state after strip: "
             f"{len(copy_masters)} master(s), {len(copy_layouts_trace)} layout(s)."
         )
+        await _report_progress(
+            progress=10,
+            total=100,
+            message="Template copied and prepared.",
+        )
         logger.info(
             f"[create_audit_presentation] Copy masters: "
             f"{json.dumps(copy_masters, ensure_ascii=False)}"
@@ -1316,11 +1393,27 @@ async def create_audit_presentation(
             f"[create_audit_presentation] Phase A: creating {len(creation_requests)} "
             f"slide(s) sequentially (one createSlide per batchUpdate call)."
         )
+        # Phase A spans 15→50% of the overall progress bar.
+        phase_a_total = max(1, len(creation_requests))
+        await _report_progress(
+            progress=15,
+            total=100,
+            message=f"Phase A: creating {phase_a_total} slide(s)…",
+        )
+
+        async def _phase_a_progress(done: int, total: int) -> None:
+            await _report_progress(
+                progress=15 + 35 * (done / total),
+                total=100,
+                message=f"Phase A: created slide {done}/{total}",
+            )
+
         await _execute_slides_sequentially(
             slides_service,
             presentation_id,
             creation_requests,
             label_prefix="slides.createSlide",
+            on_step_done=_phase_a_progress,
         )
 
         # Verification pass: refetch the deck and confirm every pre-allocated
@@ -1507,8 +1600,28 @@ async def create_audit_presentation(
             f"content request(s) per-slide (≤{MAX_REQUESTS_PER_BATCH} per batchUpdate, "
             f"never crossing slide boundaries)."
         )
+        # Phase B spans 55→90% of the overall progress bar.
+        await _report_progress(
+            progress=55,
+            total=100,
+            message=(
+                f"Phase B: filling {total_content_requests} content "
+                f"request(s) across {len(per_slide_content)} slide(s)…"
+            ),
+        )
+
+        async def _phase_b_progress(done: int, total: int) -> None:
+            await _report_progress(
+                progress=55 + 35 * (done / total),
+                total=100,
+                message=f"Phase B: filled slide {done}/{total}",
+            )
+
         await _execute_slides_per_slide(
-            slides_service, presentation_id, per_slide_content
+            slides_service,
+            presentation_id,
+            per_slide_content,
+            on_slide_done=_phase_b_progress,
         )
 
         # 8) Speaker notes pass: re-fetch to find each slide's speakerNotesObjectId, then insert.
@@ -1516,6 +1629,11 @@ async def create_audit_presentation(
             (i, s["speaker_notes"]) for i, s in enumerate(slides) if s.get("speaker_notes")
         ]
         if notes_specs:
+            await _report_progress(
+                progress=92,
+                total=100,
+                message=f"Adding speaker notes for {len(notes_specs)} slide(s)…",
+            )
             updated_presentation = await _run_with_transient_retry(
                 slides_service.presentations().get(presentationId=presentation_id).execute,
                 label="slides.presentations.get (notes pass)",
@@ -1625,5 +1743,10 @@ async def create_audit_presentation(
     logger.info(
         f"[create_audit_presentation] Success: deck {presentation_id} ({len(slides)} slides), "
         f"data_sheet={data_sheet_meta['spreadsheet_id'] if data_sheet_meta else 'none'}"
+    )
+    await _report_progress(
+        progress=100,
+        total=100,
+        message=f"Done: {presentation_url}",
     )
     return json.dumps(result, indent=2)
