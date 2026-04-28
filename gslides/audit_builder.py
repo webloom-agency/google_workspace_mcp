@@ -35,6 +35,60 @@ from gslides import _builders as B
 logger = logging.getLogger(__name__)
 
 
+_IMAGE_REQUEST_KEYS = ("replaceImage", "createImage")
+_IMAGE_FETCH_ERROR_MARKERS = (
+    # Slides surfaces a few different phrasings depending on whether the URL is
+    # unreachable, returns a non-200, or simply doesn't exist. Match all of
+    # them case-insensitively so a hallucinated URL never aborts the build.
+    "the provided image was not found",
+    "image was not found",
+    "could not fetch image",
+    "unable to download image",
+    "unable to retrieve image",
+    "image url",
+    "invalid image url",
+    "image is not accessible",
+)
+
+
+def _is_image_request(req: Dict[str, Any]) -> bool:
+    """True if the Slides request creates or replaces an image (URL-driven)."""
+    return any(k in req for k in _IMAGE_REQUEST_KEYS)
+
+
+def _image_url_in_request(req: Dict[str, Any]) -> Optional[str]:
+    """Best-effort URL extraction for log lines."""
+    for k in _IMAGE_REQUEST_KEYS:
+        if k in req:
+            return (req[k] or {}).get("url")
+    return None
+
+
+def _is_image_fetch_error(exc: HttpError) -> bool:
+    """True for Slides 4xx errors caused by an image URL the API can't fetch.
+
+    Hallucinated, expired, or auth-walled image URLs (a common LLM failure
+    mode) surface as HTTP 400 from `replaceImage` / `createImage`. These are
+    NOT bugs in the deck schema — they are bad data we should skip with a
+    warning so the rest of the build completes. The matcher is intentionally
+    permissive to cover Slides' several phrasings.
+    """
+    msg = ""
+    try:
+        content = getattr(exc, "content", None)
+        if content:
+            msg = content.decode("utf-8", errors="replace").lower()
+    except Exception:
+        pass
+    if not msg:
+        msg = str(exc).lower()
+    return any(m in msg for m in _IMAGE_FETCH_ERROR_MARKERS)
+
+
+def _chunk_has_image_request(chunk: List[Dict[str, Any]]) -> bool:
+    return any(_is_image_request(r) for r in chunk)
+
+
 async def _report_progress(
     progress: float,
     total: Optional[float] = None,
@@ -759,13 +813,30 @@ async def _execute_slides_per_slide(
                 status = getattr(e, "status_code", None) or (
                     getattr(e, "resp", None).status if getattr(e, "resp", None) else None
                 )
-                if status not in (500, 502, 503, 504):
-                    raise
-                logger.warning(
-                    f"[create_audit_presentation:{label}] Batch failed with HTTP {status} "
-                    f"after retries; falling back to per-request execution to isolate the "
-                    f"problem and work around the Slides backend's multi-request 500 pathology."
+                # Bad image URLs (a common LLM hallucination) come back as
+                # HTTP 400 on the whole batch even though only one request is
+                # to blame. Falling back to per-request mode lets us isolate
+                # and skip the offending image instead of aborting the deck.
+                image_fetch_isolation = (
+                    status not in (500, 502, 503, 504)
+                    and _chunk_has_image_request(chunk)
+                    and _is_image_fetch_error(e)
                 )
+                if status not in (500, 502, 503, 504) and not image_fetch_isolation:
+                    raise
+                if image_fetch_isolation:
+                    logger.warning(
+                        f"[create_audit_presentation:{label}] Batch returned HTTP {status} "
+                        f"with an image-fetch error message. Falling back to per-request "
+                        f"execution to skip the offending image and keep the rest of the "
+                        f"deck."
+                    )
+                else:
+                    logger.warning(
+                        f"[create_audit_presentation:{label}] Batch failed with HTTP {status} "
+                        f"after retries; falling back to per-request execution to isolate the "
+                        f"problem and work around the Slides backend's multi-request 500 pathology."
+                    )
                 for req_idx, single_req in enumerate(chunk):
                     sub_label = (
                         f"slides.batchUpdate slide#{slide_idx + 1} "
@@ -801,6 +872,21 @@ async def _execute_slides_per_slide(
                                 f"returns HTTP {sub_status} for this single request after "
                                 f"the per-batch retry budget. Skipping it so the rest of "
                                 f"the deck can complete. Request body: {req_dump}"
+                            )
+                            continue
+                        # Bad image URL (hallucinated, expired, auth-walled,
+                        # SVG-only host that Slides can't render): treat as a
+                        # soft skip so one broken URL doesn't kill a 30-slide
+                        # deck. The slide is still created — only the image
+                        # is missing — and the warning tells the user exactly
+                        # which URL to fix.
+                        if _is_image_request(single_req) and _is_image_fetch_error(sub_e):
+                            bad_url = _image_url_in_request(single_req) or "<unknown>"
+                            logger.warning(
+                                f"[create_audit_presentation:{sub_label}] Skipping image "
+                                f"because the Slides API could not fetch it (HTTP "
+                                f"{sub_status}). The rest of the deck will still be "
+                                f"generated. URL: {bad_url}"
                             )
                             continue
                         # 4xx and other errors are real bugs in the request
