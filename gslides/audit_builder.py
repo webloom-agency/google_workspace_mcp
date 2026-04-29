@@ -36,19 +36,6 @@ logger = logging.getLogger(__name__)
 
 
 _IMAGE_REQUEST_KEYS = ("replaceImage", "createImage")
-_IMAGE_FETCH_ERROR_MARKERS = (
-    # Slides surfaces a few different phrasings depending on whether the URL is
-    # unreachable, returns a non-200, or simply doesn't exist. Match all of
-    # them case-insensitively so a hallucinated URL never aborts the build.
-    "the provided image was not found",
-    "image was not found",
-    "could not fetch image",
-    "unable to download image",
-    "unable to retrieve image",
-    "image url",
-    "invalid image url",
-    "image is not accessible",
-)
 
 
 def _is_image_request(req: Dict[str, Any]) -> bool:
@@ -64,29 +51,80 @@ def _image_url_in_request(req: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _is_image_fetch_error(exc: HttpError) -> bool:
-    """True for Slides 4xx errors caused by an image URL the API can't fetch.
-
-    Hallucinated, expired, or auth-walled image URLs (a common LLM failure
-    mode) surface as HTTP 400 from `replaceImage` / `createImage`. These are
-    NOT bugs in the deck schema — they are bad data we should skip with a
-    warning so the rest of the build completes. The matcher is intentionally
-    permissive to cover Slides' several phrasings.
-    """
+def _http_error_message(exc: HttpError) -> str:
+    """Extract the human-readable message from an HttpError, lowercased."""
     msg = ""
     try:
         content = getattr(exc, "content", None)
         if content:
-            msg = content.decode("utf-8", errors="replace").lower()
+            msg = content.decode("utf-8", errors="replace")
     except Exception:
         pass
     if not msg:
-        msg = str(exc).lower()
-    return any(m in msg for m in _IMAGE_FETCH_ERROR_MARKERS)
+        msg = str(exc)
+    return msg.lower()
+
+
+def _is_image_soft_failure(req: Dict[str, Any], status: Optional[int]) -> bool:
+    """True if a failing Slides request is a `replaceImage`/`createImage` with a
+    4xx status — i.e. an image-fetch / format / auth problem we should skip
+    rather than abort on.
+
+    We deliberately treat ALL 4xx on image requests as soft failures because:
+      • LLM agents routinely hallucinate URLs (404 "not found").
+      • Brand assets are often behind a CDN that requires referer / cookie
+        auth (403 "forbidden", "access denied").
+      • Slides cannot fetch SVG from arbitrary hosts and rejects unsupported
+        formats (400 "image format not supported").
+      • Some hosts time out or rate-limit Google's fetcher (400 "could not
+        fetch", "unable to download").
+      • Images that exceed Slides' size budget come back as 400 "image too
+        large".
+
+    None of these are bugs in the deck schema — they are bad data, and the
+    correct UX is "log loudly, skip the image, finish the deck." The slide
+    is still created (it just keeps the layout's empty PICTURE placeholder
+    visible, exactly as if `image_placeholders` had been omitted).
+
+    Non-image 4xx errors STILL raise loudly, so real schema bugs are caught.
+    """
+    if not _is_image_request(req):
+        return False
+    if status is None:
+        return False
+    return 400 <= status < 500
 
 
 def _chunk_has_image_request(chunk: List[Dict[str, Any]]) -> bool:
     return any(_is_image_request(r) for r in chunk)
+
+
+def _chunk_image_failure_likely(chunk: List[Dict[str, Any]], exc: HttpError) -> bool:
+    """True if a 4xx on a multi-request chunk is most likely caused by an
+    image request inside that chunk (so falling back to per-request mode
+    will isolate and skip the offender, leaving the rest intact).
+
+    Heuristic: the chunk contains at least one image request, AND the error
+    message mentions either the image-related Slides field name or any of
+    the common fetch/auth/format complaints.
+    """
+    if not _chunk_has_image_request(chunk):
+        return False
+    msg = _http_error_message(exc)
+    image_signals = (
+        "replaceimage",
+        "createimage",
+        "image",  # broad but safe — we already confirmed the chunk has an image request.
+        "forbidden",
+        "access",
+        "not found",
+        "could not fetch",
+        "unable to download",
+        "unable to retrieve",
+        "format",
+        "url",
+    )
+    return any(s in msg for s in image_signals)
 
 
 async def _report_progress(
@@ -817,19 +855,23 @@ async def _execute_slides_per_slide(
                 # HTTP 400 on the whole batch even though only one request is
                 # to blame. Falling back to per-request mode lets us isolate
                 # and skip the offending image instead of aborting the deck.
+                # We use a permissive heuristic here so any 4xx whose message
+                # plausibly refers to an image gets isolated; the per-request
+                # handler then makes the final soft-skip decision based on
+                # which exact request fails.
                 image_fetch_isolation = (
-                    status not in (500, 502, 503, 504)
-                    and _chunk_has_image_request(chunk)
-                    and _is_image_fetch_error(e)
+                    status is not None
+                    and 400 <= status < 500
+                    and status not in (500, 502, 503, 504)
+                    and _chunk_image_failure_likely(chunk, e)
                 )
                 if status not in (500, 502, 503, 504) and not image_fetch_isolation:
                     raise
                 if image_fetch_isolation:
                     logger.warning(
                         f"[create_audit_presentation:{label}] Batch returned HTTP {status} "
-                        f"with an image-fetch error message. Falling back to per-request "
-                        f"execution to skip the offending image and keep the rest of the "
-                        f"deck."
+                        f"and the chunk contains an image request. Falling back to per-request "
+                        f"execution to skip the offending image and keep the rest of the deck."
                     )
                 else:
                     logger.warning(
@@ -874,19 +916,22 @@ async def _execute_slides_per_slide(
                                 f"the deck can complete. Request body: {req_dump}"
                             )
                             continue
-                        # Bad image URL (hallucinated, expired, auth-walled,
-                        # SVG-only host that Slides can't render): treat as a
-                        # soft skip so one broken URL doesn't kill a 30-slide
-                        # deck. The slide is still created — only the image
-                        # is missing — and the warning tells the user exactly
-                        # which URL to fix.
-                        if _is_image_request(single_req) and _is_image_fetch_error(sub_e):
+                        # Bad image (hallucinated URL, 403 forbidden / CDN
+                        # auth wall, unsupported format, SVG-only host, image
+                        # too large, fetch timeout, …): treat ANY 4xx on an
+                        # image request as a soft skip so a single broken
+                        # URL doesn't kill a 30-slide deck. The slide is
+                        # still created — only the image is missing — and
+                        # the warning tells the user exactly which URL to
+                        # fix and why.
+                        if _is_image_soft_failure(single_req, sub_status):
                             bad_url = _image_url_in_request(single_req) or "<unknown>"
+                            slides_msg = _http_error_message(sub_e).strip().splitlines()[0:2]
+                            slides_msg_str = " ".join(slides_msg)[:240]
                             logger.warning(
                                 f"[create_audit_presentation:{sub_label}] Skipping image "
-                                f"because the Slides API could not fetch it (HTTP "
-                                f"{sub_status}). The rest of the deck will still be "
-                                f"generated. URL: {bad_url}"
+                                f"(HTTP {sub_status}). The rest of the deck will still be "
+                                f"generated. URL: {bad_url}. Slides API said: {slides_msg_str}"
                             )
                             continue
                         # 4xx and other errors are real bugs in the request
