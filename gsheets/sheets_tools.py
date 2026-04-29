@@ -201,6 +201,81 @@ def _repair_json_string(json_str: str, context: str = "") -> Any:
     raise first_error
 
 
+def _col_idx_to_letter(idx: int) -> str:
+    """Convert a 0-based column index to A1-style column letters (0->A, 25->Z, 26->AA)."""
+    if idx < 0:
+        raise ValueError(f"Column index must be non-negative, got {idx}")
+    letters = ""
+    n = idx
+    while True:
+        letters = chr(ord("A") + n % 26) + letters
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return letters
+
+
+# Friendly aliases for column number formats. Mapped to (Sheets API type, default pattern).
+_NUMBER_FORMAT_ALIASES: Dict[str, tuple] = {
+    "TEXT":      ("TEXT",      "@"),
+    "STRING":    ("TEXT",      "@"),
+    "DATE":      ("DATE",      "yyyy-mm-dd"),
+    "DATETIME":  ("DATE_TIME", "yyyy-mm-dd hh:mm:ss"),
+    "DATE_TIME": ("DATE_TIME", "yyyy-mm-dd hh:mm:ss"),
+    "TIME":      ("TIME",      "hh:mm:ss"),
+    "NUMBER":    ("NUMBER",    "0.##"),
+    "INTEGER":   ("NUMBER",    "0"),
+    "PERCENT":   ("PERCENT",   "0.00%"),
+    "CURRENCY":  ("CURRENCY",  "#,##0.00"),
+    "EUR":       ("CURRENCY",  "#,##0.00 [$€]"),
+    "USD":       ("CURRENCY",  "[$$]#,##0.00"),
+}
+
+
+def _resolve_number_format(spec: Optional[str]) -> Optional[Dict[str, str]]:
+    """
+    Convert a user-supplied format spec (alias or literal pattern) to a Sheets
+    `numberFormat` dict, e.g. {"type": "TEXT", "pattern": "@"}.
+
+    Returns None when spec is empty/None.
+    """
+    if spec is None:
+        return None
+    if not isinstance(spec, str):
+        spec = str(spec)
+    spec = spec.strip()
+    if not spec:
+        return None
+
+    key = spec.upper()
+    if key in _NUMBER_FORMAT_ALIASES:
+        type_, pattern = _NUMBER_FORMAT_ALIASES[key]
+        return {"type": type_, "pattern": pattern}
+
+    # Treat the spec as a literal Sheets format pattern. Infer the type so the
+    # API accepts it (TEXT/PERCENT/DATE/etc. drive how USER_ENTERED parses input).
+    pattern = spec
+    lower = pattern.lower()
+    has_date_token = ("y" in lower or "d" in lower) and "m" in lower
+    has_time_token = "h" in lower or "s" in lower
+    if "@" in pattern:
+        type_ = "TEXT"
+    elif has_date_token and has_time_token:
+        type_ = "DATE_TIME"
+    elif has_date_token:
+        type_ = "DATE"
+    elif has_time_token and "m" in lower:
+        # Bare time-of-day pattern like "hh:mm:ss"
+        type_ = "TIME"
+    elif "%" in pattern:
+        type_ = "PERCENT"
+    elif "$" in pattern or "€" in pattern or "£" in pattern:
+        type_ = "CURRENCY"
+    else:
+        type_ = "NUMBER"
+    return {"type": type_, "pattern": pattern}
+
+
 @server.tool()
 @handle_http_errors("list_spreadsheets", is_read_only=True, service_type="sheets")
 @require_google_service("drive", "drive_read")
@@ -732,12 +807,24 @@ async def append_rows_by_headers(
     rows: Optional[Union[str, List[Dict[str, Any]]]] = None,
     value_input_option: str = "USER_ENTERED",
     write_headers_if_missing: bool = True,
+    reset_existing_rows: bool = False,
+    clear_column_format: bool = False,
+    column_formats: Optional[Union[str, Dict[str, str]]] = None,
 ) -> str:
     """
     Appends rows mapped by header names. Ensures appends happen at the end, without
     overwriting existing data. If the sheet has no headers, optionally creates them
     from the union of provided row keys. If new keys appear, extends the header row
     (creating new columns) and maps values accordingly.
+
+    NOTE on date/number behaviour: this tool writes via `spreadsheets.values.update`,
+    which does NOT touch existing cell formats. With `valueInputOption=USER_ENTERED`,
+    Google Sheets honours any pre-existing number format on the target cells (e.g. a
+    sticky "@"/Plain-text format from a prior run will store an ISO date as a literal
+    string instead of parsing it). If you re-use the same spreadsheet across runs and
+    see inconsistent date / number rendering in the same column, use
+    `reset_existing_rows=True` plus `column_formats={"<header>": "DATE"}` (or
+    `clear_column_format=True`) to get a clean, deterministic write.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -747,6 +834,25 @@ async def append_rows_by_headers(
             Can be provided as JSON string or Python list. Required.
         value_input_option (str): "RAW" or "USER_ENTERED". Defaults to "USER_ENTERED".
         write_headers_if_missing (bool): If True, write headers when sheet is empty. Defaults to True.
+        reset_existing_rows (bool): If True, clears every data row (everything below
+            row 1) before appending. Use this when you re-run a workflow against the
+            same spreadsheet ID and want a clean slate without losing the header row.
+            Defaults to False (purely additive — old rows accumulate).
+        clear_column_format (bool): If True, resets the number format on every column
+            covered by `all_headers` (rows 2+) back to Automatic before writing. This
+            wipes sticky "Plain text" / date / currency formats inherited from prior
+            runs so USER_ENTERED parses each new value freshly. Defaults to False.
+        column_formats (Optional[Union[str, Dict[str, str]]]): Per-header explicit
+            number format applied to rows 2+ BEFORE values are written. Accepts a JSON
+            string or Python dict (e.g. `{"Mois": "DATE", "ID": "TEXT"}`). Recognised
+            aliases (case-insensitive): TEXT, DATE, DATE_TIME, TIME, NUMBER, INTEGER,
+            PERCENT, CURRENCY, EUR, USD. Any other string is passed through as a
+            literal Sheets pattern (e.g. `"yyyy-mm"`, `"0.00 €"`, `"@"`). Headers not
+            present in the dict are left untouched (unless `clear_column_format=True`,
+            in which case they are reset to Automatic first). Setting a column to
+            "TEXT" forces every value in it (including ISO dates) to be stored as a
+            literal string under USER_ENTERED. Setting "DATE" forces ISO inputs to be
+            parsed as dates and rendered with the chosen pattern.
 
     Returns:
         str: Summary of headers and rows appended.
@@ -765,6 +871,18 @@ async def append_rows_by_headers(
             )
         except json.JSONDecodeError as e:
             raise Exception(f"Invalid JSON format for rows: {e}")
+
+    # Parse column_formats if provided as JSON string
+    if column_formats is not None and isinstance(column_formats, str):
+        try:
+            parsed_fmt = _repair_json_string(column_formats, context="append_rows_by_headers.column_formats")
+            if not isinstance(parsed_fmt, dict):
+                raise ValueError(
+                    f"column_formats must decode to an object, got {type(parsed_fmt).__name__}"
+                )
+            column_formats = parsed_fmt
+        except (json.JSONDecodeError, ValueError) as e:
+            raise Exception(f"Invalid column_formats: {e}")
 
     # Handle case where rows is wrapped in an object (e.g., {"result": [...]}, {"answer": [...]})
     # Loop to handle multi-level nesting (e.g., {"answer": {"answer": [...]}})
@@ -878,6 +996,123 @@ async def append_rows_by_headers(
             "No headers exist and write_headers_if_missing is False; cannot map rows."
         )
 
+    # 3b) Resolve target sheet metadata once — needed for sheetId-scoped requests
+    #     (clear / format) and reused later for grid expansion.
+    spreadsheet_meta = await asyncio.to_thread(
+        service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute
+    )
+    target_sheet = None
+    for s in spreadsheet_meta.get("sheets", []):
+        if s.get("properties", {}).get("title") == sheet_name:
+            target_sheet = s
+            break
+
+    target_sheet_id: Optional[int] = None
+    current_max_rows = 1000
+    current_max_cols = 26
+    if target_sheet:
+        grid_props = target_sheet.get("properties", {}).get("gridProperties", {})
+        current_max_rows = grid_props.get("rowCount", 1000)
+        current_max_cols = grid_props.get("columnCount", 26)
+        target_sheet_id = target_sheet["properties"]["sheetId"]
+
+    # 3c) Optional reset: wipe every data row (everything below the header) so the
+    #     next_row scan starts at row 2 and no stale values/formats from previous
+    #     runs can leak into the new write.
+    if reset_existing_rows:
+        end_col_letter = _col_idx_to_letter(max(len(all_headers) - 1, 0))
+        clear_range = f"{sheet_name}!A2:{end_col_letter}{current_max_rows}"
+        logger.info(
+            f"[append_rows_by_headers] reset_existing_rows=True — clearing data range {clear_range}"
+        )
+        await asyncio.to_thread(
+            service.spreadsheets()
+            .values()
+            .clear(spreadsheetId=spreadsheet_id, range=clear_range)
+            .execute
+        )
+
+    # 3d) Optional column-format management. Done BEFORE writing values so that
+    #     USER_ENTERED parses each cell against the format we just set (critical
+    #     for "TEXT"/"DATE" semantics).
+    format_requests: List[Dict[str, Any]] = []
+    if (clear_column_format or column_formats) and target_sheet_id is not None:
+        # Validate column_formats keys against headers and warn on typos.
+        normalized_formats: Dict[str, Dict[str, str]] = {}
+        if column_formats:
+            if not isinstance(column_formats, dict):
+                raise Exception(
+                    f"column_formats must be a dict mapping header -> format spec, got {type(column_formats).__name__}"
+                )
+            for header_name, spec in column_formats.items():
+                if header_name not in all_headers:
+                    logger.warning(
+                        f"[append_rows_by_headers] column_formats key '{header_name}' "
+                        f"is not among the sheet headers {all_headers}; ignored."
+                    )
+                    continue
+                resolved = _resolve_number_format(spec)
+                if resolved is None:
+                    logger.warning(
+                        f"[append_rows_by_headers] Empty format spec for '{header_name}'; ignored."
+                    )
+                    continue
+                normalized_formats[header_name] = resolved
+
+        # Clear-then-set ordering: wipe formats first (when requested), then apply
+        # explicit column_formats on top so the explicit ones win.
+        if clear_column_format:
+            for col_idx, _h in enumerate(all_headers):
+                format_requests.append(
+                    {
+                        "updateCells": {
+                            "range": {
+                                "sheetId": target_sheet_id,
+                                "startRowIndex": 1,  # skip header row
+                                "startColumnIndex": col_idx,
+                                "endColumnIndex": col_idx + 1,
+                            },
+                            "fields": "userEnteredFormat.numberFormat",
+                        }
+                    }
+                )
+
+        for header_name, number_format in normalized_formats.items():
+            col_idx = all_headers.index(header_name)
+            format_requests.append(
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": target_sheet_id,
+                            "startRowIndex": 1,  # skip header row
+                            "startColumnIndex": col_idx,
+                            "endColumnIndex": col_idx + 1,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": number_format,
+                            }
+                        },
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                }
+            )
+
+        if format_requests:
+            logger.info(
+                f"[append_rows_by_headers] Applying {len(format_requests)} format request(s) "
+                f"(clear_column_format={clear_column_format}, "
+                f"column_formats={list(normalized_formats.keys()) if normalized_formats else []})"
+            )
+            await asyncio.to_thread(
+                service.spreadsheets()
+                .batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"requests": format_requests},
+                )
+                .execute
+            )
+
     # 4) Map input objects to row lists aligned with all_headers,
     #    flattening any nested lists/dicts to sheet-safe primitives
     def _flatten_cell(value, row_idx: int, col_idx: int):
@@ -927,26 +1162,14 @@ async def append_rows_by_headers(
     # If sheet has headers, existing_rows >= 1; next_row is existing_rows + 1
     next_row = max(2, existing_rows + 1)  # Never write data to row 1 when we have headers
 
-    # 6) Auto-expand the sheet grid if needed (.update() cannot write beyond grid limits)
+    # 6) Auto-expand the sheet grid if needed (.update() cannot write beyond grid limits).
+    #    Reuses the metadata already fetched in step 3b — neither values.clear() nor
+    #    repeatCell/updateCells changes the grid dimensions, so the cached values
+    #    (target_sheet_id, current_max_rows, current_max_cols) are still accurate.
     required_rows = next_row + len(values_to_append) - 1  # last row we'll write to
     required_cols = len(all_headers)
 
-    # Get the sheet's current grid dimensions and sheetId
-    spreadsheet_meta = await asyncio.to_thread(
-        service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute
-    )
-    target_sheet = None
-    for s in spreadsheet_meta.get("sheets", []):
-        if s.get("properties", {}).get("title") == sheet_name:
-            target_sheet = s
-            break
-    
-    if target_sheet:
-        grid_props = target_sheet.get("properties", {}).get("gridProperties", {})
-        current_max_rows = grid_props.get("rowCount", 1000)
-        current_max_cols = grid_props.get("columnCount", 26)
-        target_sheet_id = target_sheet["properties"]["sheetId"]
-
+    if target_sheet_id is not None:
         expand_requests = []
 
         if required_rows > current_max_rows:
