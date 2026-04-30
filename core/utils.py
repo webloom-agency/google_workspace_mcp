@@ -242,13 +242,27 @@ def handle_http_errors(tool_name: str, is_read_only: bool = False, service_type:
     It wraps a tool function, catches HttpError, logs a detailed error message,
     and raises a generic Exception with a user-friendly message.
 
-    If is_read_only is True, it will also catch ssl.SSLError and retry with
-    exponential backoff. After exhausting retries, it raises a TransientNetworkError.
+    Retry behaviour is gated on ``is_read_only``:
+
+    * ``is_read_only=True`` — the decorator will retry the WHOLE tool call on
+      transient SSL errors, HTTP 5xx (500/502/503), and HTTP 429 rate limits,
+      with exponential backoff. Safe because re-running a read returns the
+      same data.
+    * ``is_read_only=False`` (default) — NO transient-retry. Re-invoking a
+      tool that has side effects (creating Drive files, Slides, Sheets, Docs,
+      Calendar events, sending emails, …) would duplicate those side effects
+      every retry. Write tools that need transient-error tolerance must
+      implement it at the granular level inside the tool body (e.g. retrying
+      individual ``batchUpdate`` calls), not by re-running the whole tool.
 
     Args:
         tool_name (str): The name of the tool being decorated (e.g., 'list_calendars').
-        is_read_only (bool): If True, the operation is considered safe to retry on
-                             transient network errors. Defaults to False.
+        is_read_only (bool): True for tools that perform NO writes (no create/
+                             update/delete on any Google service). Enables
+                             whole-tool retry on transient errors. Defaults
+                             to False — set this conservatively; if there's
+                             any doubt, leave it False and handle retries
+                             inside the tool.
         service_type (str): Optional. The Google service type (e.g., 'calendar', 'gmail').
     """
 
@@ -277,9 +291,29 @@ def handle_http_errors(tool_name: str, is_read_only: bool = False, service_type:
                             "This is likely a temporary network or certificate issue. Please try again shortly."
                         ) from e
                 except HttpError as error:
+                    # Tool-level retry on transient errors (5xx) and rate limits (429).
+                    #
+                    # CRITICAL SAFETY GATE: only retry when `is_read_only=True`.
+                    # The retry mechanism here re-invokes the ENTIRE tool function
+                    # from the top, which is safe for read-only ops (worst case:
+                    # an extra GET) but DANGEROUS for write ops — every retry of
+                    # a tool that creates Drive files, Slides, Sheets, Docs,
+                    # Calendar events, emails, etc. duplicates the side effect.
+                    #
+                    # Real-world bite: a `create_audit_presentation` call that
+                    # tripped a per-minute Slides quota mid-build was retried
+                    # twice by this decorator, producing THREE complete deck +
+                    # data-sheet pairs in Drive (each kept by `keep_on_error`
+                    # for debugging). Google's "retry on 429" guidance is for
+                    # individual API requests; high-level write workflows must
+                    # handle transient errors at the granular level inside the
+                    # tool itself (which `create_audit_presentation` already
+                    # does via `_run_with_transient_retry`).
+                    can_retry_transient = is_read_only and attempt < max_retries - 1
+
                     # Retry on transient server errors (500, 502, 503) with exponential backoff
                     # Google recommends retrying these: https://cloud.google.com/apis/design/errors#retrying_errors
-                    if error.resp.status in (500, 502, 503) and attempt < max_retries - 1:
+                    if error.resp.status in (500, 502, 503) and can_retry_transient:
                         delay = base_delay * (2 ** attempt)
                         logger.warning(
                             f"[{tool_name}] Transient HTTP {error.resp.status} on attempt {attempt + 1}/{max_retries}: "
@@ -289,7 +323,7 @@ def handle_http_errors(tool_name: str, is_read_only: bool = False, service_type:
                         continue
 
                     # Retry on rate limit (429) with longer backoff
-                    if error.resp.status == 429 and attempt < max_retries - 1:
+                    if error.resp.status == 429 and can_retry_transient:
                         delay = base_delay * (2 ** (attempt + 1))  # longer backoff for rate limits
                         logger.warning(
                             f"[{tool_name}] Rate limited (429) on attempt {attempt + 1}/{max_retries}: "

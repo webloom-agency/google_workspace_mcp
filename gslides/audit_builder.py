@@ -805,15 +805,33 @@ async def _execute_slides_per_slide(
     """
     if not per_slide_requests:
         return
-    # Fail-fast retry budgets so the per-request fallback ALWAYS runs within
-    # the MCP transport's 60s timeout window. Worst-case math:
-    #   chunk: 2 attempts × (≈5s API + 1s sleep) ≈ 12s
-    #   fallback: N requests × 3 attempts × (≈5s API + ≤4s sleep) per request
-    # For typical slides with ≤10 content requests, total well under 60s.
-    # We deliberately do NOT use the generic 6-attempt budget (1+2+4+8+16+32
-    # = 63s of sleeps alone) which prevented the fallback from ever firing
-    # in practice.
-    chunk_max_attempts = 2
+    # Per-chunk retry budget tuned for 429 quota windows.
+    #
+    # Slides enforces "Write requests per minute per user" = 60 (default). On
+    # a 30+ slide deck with charts/tables we routinely brush this ceiling in
+    # the back half of Phase B. Each 429 needs the rolling minute to roll
+    # before it'll clear, so a 2-attempt budget (~5s of waiting) was
+    # nowhere near enough — it gave up and propagated the 429 to the
+    # caller, breaking the build.
+    #
+    # 5 attempts × base-5s exponential backoff in `_run_with_transient_retry`
+    # gives delays of 5 → 10 → 20 → 40s = up to 75s of total waiting before
+    # the final attempt. That comfortably covers a saturated 60/min window.
+    #
+    # Why not the generic 6-attempt budget? At 5 attempts the worst-case
+    # per-chunk pause is bounded at ~75s (rare); 6 would push it to ~155s
+    # which is cosmetically slow even though MCP progress notifications now
+    # keep the streaming-HTTP connection warm indefinitely. 5 is the sweet
+    # spot: beats any quota window, doesn't make a happy build feel slow.
+    #
+    # NOTE: 429s exhausting this budget propagate as a hard error (per-
+    # request fallback only triggers on 5xx, not 429 — splitting won't help
+    # a 429 caused by a per-user write quota). The right escalation is a
+    # quota bump in Google Cloud Console, not more retries.
+    chunk_max_attempts = 5
+    # Per-request fallback only runs for 5xx ("multi-request 500 pathology"
+    # against custom-layout templates). 3 attempts × ≈5s of sleeps = ~15s
+    # per request stays well bounded even when a chunk has many requests.
     per_request_max_attempts = 3
     total_slides = len(per_slide_requests)
     for slide_pos, (slide_idx, slide_requests) in enumerate(per_slide_requests):
