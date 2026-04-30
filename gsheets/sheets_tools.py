@@ -10,6 +10,7 @@ import json
 import re
 from typing import List, Optional, Union, Dict, Any
 
+from googleapiclient.errors import HttpError
 
 from auth.service_decorator import require_google_service, require_multiple_services
 from core.server import server
@@ -810,6 +811,7 @@ async def append_rows_by_headers(
     reset_existing_rows: bool = False,
     clear_column_format: bool = False,
     column_formats: Optional[Union[str, Dict[str, str]]] = None,
+    create_sheet_if_missing: bool = True,
 ) -> str:
     """
     Appends rows mapped by header names. Ensures appends happen at the end, without
@@ -824,7 +826,10 @@ async def append_rows_by_headers(
     string instead of parsing it). If you re-use the same spreadsheet across runs and
     see inconsistent date / number rendering in the same column, use
     `reset_existing_rows=True` plus `column_formats={"<header>": "DATE"}` (or
-    `clear_column_format=True`) to get a clean, deterministic write.
+    `clear_column_format=True`) to get a clean, deterministic write. When the sheet
+    is auto-created via `create_sheet_if_missing=True` it starts with no headers and
+    no formats, so `write_headers_if_missing=True` (default) and `column_formats`
+    work from a clean slate on the first call.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -853,6 +858,11 @@ async def append_rows_by_headers(
             "TEXT" forces every value in it (including ISO dates) to be stored as a
             literal string under USER_ENTERED. Setting "DATE" forces ISO inputs to be
             parsed as dates and rendered with the chosen pattern.
+        create_sheet_if_missing (bool): If True, automatically create the target
+            sheet/tab when it doesn't exist in the spreadsheet (using addSheet)
+            before reading headers/writing rows. Defaults to True. When False,
+            the tool propagates the original Google "Unable to parse range" / 400
+            error if the sheet is missing.
 
     Returns:
         str: Summary of headers and rows appended.
@@ -943,13 +953,50 @@ async def append_rows_by_headers(
     if not DISABLE_UTF8_FIX:
         rows = fix_encoding_recursive(rows, log_samples=True)
 
-    # 1) Read existing header row
-    header_result = await asyncio.to_thread(
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!1:1")
-        .execute
-    )
+    # 1) Read existing header row.
+    # If `create_sheet_if_missing=True` (default), transparently create the
+    # target tab via addSheet when the first read fails because the tab does
+    # not exist yet. This unblocks workflows that target a freshly-created
+    # spreadsheet (e.g. the auxiliary data sheet built by
+    # `create_audit_presentation`) without requiring the caller to pre-create
+    # every tab. The detection is intentionally conservative: it requires
+    # both an HTTP 400/404 status AND a message that looks like a missing-
+    # sheet error, so unrelated 4xx (auth, quota, invalid spreadsheet id)
+    # still propagate untouched.
+    async def _read_header_row():
+        return await asyncio.to_thread(
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!1:1")
+            .execute
+        )
+
+    try:
+        header_result = await _read_header_row()
+    except HttpError as e:
+        msg = str(e)
+        status = getattr(e, "status_code", None) or getattr(
+            getattr(e, "resp", None), "status", None
+        )
+        is_missing_sheet = (
+            status in (400, 404)
+            and ("Unable to parse range" in msg or "not found" in msg.lower())
+        )
+        if not (create_sheet_if_missing and is_missing_sheet):
+            raise
+        logger.info(
+            f"[append_rows_by_headers] Sheet '{sheet_name}' missing in spreadsheet "
+            f"{spreadsheet_id} — auto-creating (create_sheet_if_missing=True)."
+        )
+        await asyncio.to_thread(
+            service.spreadsheets()
+            .batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
+            )
+            .execute
+        )
+        header_result = await _read_header_row()
 
     existing_header_values = header_result.get("values", [])
     existing_headers: List[str] = existing_header_values[0] if existing_header_values else []
