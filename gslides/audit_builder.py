@@ -201,7 +201,16 @@ INTER_BATCH_SLEEP_S = 0.15
 # Transient Slides 500s nearly always clear within this window.
 BATCH_MAX_ATTEMPTS = 6
 BATCH_BASE_DELAY_S = 1.0
-BATCH_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+# 302 included intentionally: when Google's frontend (GFE) refuses a request
+# briefly (regional Slides backend hiccup, suspected-abuse heuristic, routing
+# failover during maintenance), it returns an HTTP 302 redirect to
+# https://www.google.com/unavailable.html instead of a clean 5xx. From the
+# API client's perspective this is functionally a 503 — a transient
+# unavailability that clears within seconds — but `googleapiclient` raises
+# HttpError(302) because the redirect target isn't a valid API endpoint. We
+# treat it identically to a 503: exponential backoff, retry, eventually
+# surface the failure if it persists past the retry budget.
+BATCH_RETRYABLE_STATUSES = {302, 429, 500, 502, 503, 504}
 
 _BASIC_CHART_TYPES = {"BAR", "COLUMN", "LINE", "AREA", "SCATTER", "COMBO", "STEPPED_AREA"}
 _PIE_CHART_TYPES = {"PIE", "DOUGHNUT"}
