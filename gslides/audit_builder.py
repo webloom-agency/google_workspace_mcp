@@ -38,6 +38,240 @@ logger = logging.getLogger(__name__)
 _IMAGE_REQUEST_KEYS = ("replaceImage", "createImage")
 
 
+# -------------------------------------------------------------------
+# Content-capacity audit (non-blocking)
+# -------------------------------------------------------------------
+# Slides has no overflow protection: text past the box is clipped or AutoFit
+# shrinks it to an unreadable size. We can't detect overflow server-side
+# (would require rendering each slide), but we CAN warn when content
+# obviously exceeds the layout's safe capacity, so regressions in agent
+# output show up loudly in the logs without ever blocking a build.
+#
+# These thresholds match `gslides/AGENT_SYSTEM_PROMPT.md` rule #11. Two
+# tiers per field:
+#   * SOFT — content is past the comfortable target; warn so the agent's
+#     output can be tightened on the next iteration.
+#   * HARD — content will almost certainly clip or auto-shrink to
+#     illegibility; warn more loudly with a "split this slide" hint.
+#
+# Limits are calibrated to the webloom audit template's master text styles
+# (Inter ~13–14pt body, ~24pt title) on the 720×405 PT page. Other
+# templates may want different numbers; the warnings stay informative
+# either way and never block.
+_CAPACITY_LIMITS = {
+    "title": {"soft": 60, "hard": 90},
+    "subtitle": {"soft": 80, "hard": 140},
+    "body_default": {"soft": 500, "hard": 700},
+    "body_chart_side": {"soft": 300, "hard": 450},
+    "body_two_columns": {"soft": 250, "hard": 400},
+    "table_rows": {"soft": 8, "hard": 10},
+    "table_cols": {"soft": 5, "hard": 6},
+    "table_cell": {"soft": 50, "hard": 80},
+}
+
+_LAYOUT_BODY_LIMIT = {
+    "Title + Body": "body_default",
+    "Title + Chart + Body": "body_chart_side",
+    "Two Columns": "body_two_columns",
+}
+
+
+def _measure_text(value: Any) -> int:
+    """Return the character length of a body/title value, accepting either a
+    plain string or a list of strings (for multi-column layouts)."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        return sum(_measure_text(v) for v in value)
+    return len(str(value))
+
+
+def _audit_slide_capacity(
+    slide_idx: int, slide_spec: Dict[str, Any]
+) -> List[Tuple[str, str]]:
+    """Inspect one slide spec and return a list of (severity, message)
+    tuples for each capacity overage. Pure / no side effects."""
+    findings: List[Tuple[str, str]] = []
+    layout = slide_spec.get("layout") or "BLANK"
+    fields = slide_spec.get("fields") or {}
+
+    title_text = fields.get("title")
+    if title_text:
+        title_len = _measure_text(title_text)
+        lim = _CAPACITY_LIMITS["title"]
+        if title_len > lim["hard"]:
+            findings.append((
+                "HARD",
+                f"title is {title_len} chars (hard cliff: {lim['hard']}). "
+                f"Will wrap to 2+ lines and likely clip the layout's title "
+                f"strip — shorten or move detail to the body.",
+            ))
+        elif title_len > lim["soft"]:
+            findings.append((
+                "SOFT",
+                f"title is {title_len} chars (soft target: {lim['soft']}). "
+                f"Risks wrapping awkwardly — consider a tighter phrasing.",
+            ))
+
+    subtitle_text = fields.get("subtitle")
+    if subtitle_text:
+        sub_len = _measure_text(subtitle_text)
+        lim = _CAPACITY_LIMITS["subtitle"]
+        if sub_len > lim["hard"]:
+            findings.append((
+                "HARD",
+                f"subtitle is {sub_len} chars (hard cliff: {lim['hard']}). "
+                f"Will overflow the SUBTITLE placeholder.",
+            ))
+        elif sub_len > lim["soft"]:
+            findings.append((
+                "SOFT",
+                f"subtitle is {sub_len} chars (soft target: {lim['soft']}).",
+            ))
+
+    body_value = fields.get("body")
+    if body_value:
+        body_key = _LAYOUT_BODY_LIMIT.get(layout, "body_default")
+        lim = _CAPACITY_LIMITS[body_key]
+        if isinstance(body_value, list):
+            for col_idx, col_value in enumerate(body_value):
+                col_len = _measure_text(col_value)
+                if col_len > lim["hard"]:
+                    findings.append((
+                        "HARD",
+                        f"body[{col_idx}] is {col_len} chars (hard cliff: "
+                        f"{lim['hard']} for '{layout}'). Will clip or "
+                        f"AutoFit-shrink to illegible — split this column "
+                        f"across multiple slides ('(1/N)', '(2/N)').",
+                    ))
+                elif col_len > lim["soft"]:
+                    findings.append((
+                        "SOFT",
+                        f"body[{col_idx}] is {col_len} chars (soft target: "
+                        f"{lim['soft']} for '{layout}'). Consider trimming.",
+                    ))
+        else:
+            body_len = _measure_text(body_value)
+            if body_len > lim["hard"]:
+                findings.append((
+                    "HARD",
+                    f"body is {body_len} chars (hard cliff: {lim['hard']} "
+                    f"for '{layout}'). Will clip or AutoFit-shrink to "
+                    f"illegible — split across multiple slides ('(1/N)', "
+                    f"'(2/N)') with logical paragraph breaks.",
+                ))
+            elif body_len > lim["soft"]:
+                findings.append((
+                    "SOFT",
+                    f"body is {body_len} chars (soft target: {lim['soft']} "
+                    f"for '{layout}'). Consider trimming or splitting.",
+                ))
+
+    table = slide_spec.get("table")
+    if isinstance(table, dict):
+        rows = table.get("rows") or []
+        headers = table.get("headers") or []
+        n_rows = len(rows)
+        n_cols = max(
+            (len(r) if isinstance(r, list) else 0 for r in rows),
+            default=len(headers),
+        )
+        rlim = _CAPACITY_LIMITS["table_rows"]
+        clim = _CAPACITY_LIMITS["table_cols"]
+        if n_rows > rlim["hard"]:
+            findings.append((
+                "HARD",
+                f"table has {n_rows} rows (hard cliff: {rlim['hard']}). "
+                f"Will overflow the table area — split into "
+                f"\"{fields.get('title') or 'Table'} (1/N)\" + \"(2/N)\" "
+                f"slides and repeat the header row in each chunk.",
+            ))
+        elif n_rows > rlim["soft"]:
+            findings.append((
+                "SOFT",
+                f"table has {n_rows} rows (soft target: {rlim['soft']}). "
+                f"Risks tight row spacing.",
+            ))
+        if n_cols > clim["hard"]:
+            findings.append((
+                "HARD",
+                f"table has {n_cols} cols (hard cliff: {clim['hard']}). "
+                f"Columns will be too narrow to read on a 720pt page.",
+            ))
+        elif n_cols > clim["soft"]:
+            findings.append((
+                "SOFT",
+                f"table has {n_cols} cols (soft target: {clim['soft']}).",
+            ))
+        # Per-cell text length.
+        cell_lim = _CAPACITY_LIMITS["table_cell"]
+        long_cells: List[Tuple[int, int, int]] = []
+        for r_i, row in enumerate(rows):
+            if not isinstance(row, list):
+                continue
+            for c_i, cell in enumerate(row):
+                if cell is None:
+                    continue
+                cell_len = len(str(cell))
+                if cell_len > cell_lim["hard"]:
+                    long_cells.append((r_i, c_i, cell_len))
+        if long_cells:
+            example = long_cells[0]
+            findings.append((
+                "HARD",
+                f"{len(long_cells)} table cell(s) exceed "
+                f"{cell_lim['hard']} chars (e.g. row {example[0] + 1} col "
+                f"{example[1] + 1}: {example[2]} chars). Will wrap "
+                f"unpredictably — shorten to <{cell_lim['soft']} chars or "
+                f"move detail to the body.",
+            ))
+
+    return findings
+
+
+def _audit_deck_capacity(slides: List[Dict[str, Any]]) -> None:
+    """Walk every slide spec and emit one log line per capacity overage.
+
+    Non-blocking: never raises, never modifies the deck. The build
+    proceeds regardless. The point is to surface "this content is going
+    to look bad" issues in the server logs so the agent's output can be
+    tightened on the next iteration.
+    """
+    soft_count = 0
+    hard_count = 0
+    for i, slide_spec in enumerate(slides):
+        try:
+            findings = _audit_slide_capacity(i, slide_spec)
+        except Exception as e:
+            # Defensive: a malformed slide spec shouldn't crash the audit.
+            logger.debug(
+                f"[create_audit_presentation] capacity audit skipped slide "
+                f"#{i + 1} due to {type(e).__name__}: {e}"
+            )
+            continue
+        for severity, message in findings:
+            layout = slide_spec.get("layout") or "BLANK"
+            line = (
+                f"[create_audit_presentation] Slide #{i + 1} ({layout}) "
+                f"{severity}: {message}"
+            )
+            if severity == "HARD":
+                hard_count += 1
+                logger.warning(line)
+            else:
+                soft_count += 1
+                logger.info(line)
+    if hard_count or soft_count:
+        logger.info(
+            f"[create_audit_presentation] Capacity audit summary: "
+            f"{hard_count} hard, {soft_count} soft warning(s). The build "
+            f"proceeds — these are advisory only. Tighten the deck JSON "
+            f"on the next pass to remove them."
+        )
+
+
 def _is_image_request(req: Dict[str, Any]) -> bool:
     """True if the Slides request creates or replaces an image (URL-driven)."""
     return any(k in req for k in _IMAGE_REQUEST_KEYS)
@@ -1029,6 +1263,39 @@ def _annotate_chart_uids(deck: Dict[str, Any]) -> List[Dict[str, Any]]:
     return flat
 
 
+def _resolve_chart_linking_mode(deck: Dict[str, Any], chart_spec: Dict[str, Any]) -> str:
+    """Slides `createSheetsChart.linkingMode` — default NOT_LINKED_IMAGE.
+
+    Per-chart ``linking_mode`` wins over deck-level ``chart_linking_mode``.
+    Recognised values (case-insensitive):
+
+    * ``LINKED`` / ``LIVE`` — live link to the Sheet; refreshes when data
+      changes but **everyone who opens the deck must be able to read the
+      spreadsheet** or the chart renders as a broken placeholder.
+    * ``NOT_LINKED_IMAGE`` / ``SNAPSHOT`` / ``STATIC`` — raster snapshot at
+      embed time; **recommended for audit decks** (no viewer Sheet access
+      required, matches PDF export behaviour).
+
+    Unknown strings log a warning and fall back to NOT_LINKED_IMAGE.
+    """
+    raw = (
+        chart_spec.get("linking_mode")
+        or deck.get("chart_linking_mode")
+        or "NOT_LINKED_IMAGE"
+    )
+    s = str(raw).strip().upper().replace("-", "_")
+    if s in ("LINKED", "LIVE"):
+        return "LINKED"
+    if s in ("NOT_LINKED_IMAGE", "SNAPSHOT", "STATIC", "UNLINKED"):
+        return "NOT_LINKED_IMAGE"
+    logger.warning(
+        f"[create_audit_presentation] Unknown chart linking_mode {raw!r} — "
+        f"using NOT_LINKED_IMAGE. Valid: LINKED, NOT_LINKED_IMAGE (aliases: "
+        f"LIVE, SNAPSHOT, STATIC)."
+    )
+    return "NOT_LINKED_IMAGE"
+
+
 # -----------------------------
 # Public MCP tool
 # -----------------------------
@@ -1188,6 +1455,16 @@ async def create_audit_presentation(
         f"[create_audit_presentation] Email: '{user_google_email}', Template: "
         f"{template_presentation_id}, Deck title: '{deck_title}', Slides: {len(slides)}"
     )
+
+    # Capacity audit (non-blocking). Emits WARNING / INFO log lines for any
+    # slide whose text or table content exceeds the layout's safe capacity
+    # (per `gslides/AGENT_SYSTEM_PROMPT.md` rule #11). The build proceeds
+    # regardless — these warnings just surface "this slide will overflow
+    # or auto-shrink to illegibility" so the agent's output can be tightened
+    # on the next iteration. Cheap heuristic, runs in ~1ms even for 100
+    # slide decks.
+    _audit_deck_capacity(slides)
+
     await _report_progress(
         progress=0,
         total=100,
@@ -1527,12 +1804,14 @@ async def create_audit_presentation(
                     )
                 # createSheetsChart targets a slide that must already exist, so
                 # it runs in the content phase too.
+                link_mode = _resolve_chart_linking_mode(deck, chart_spec)
                 this_slide_content.extend(
                     B.build_sheets_chart_requests(
                         slide_id=slide_id,
                         spreadsheet_id=data_sheet_meta["spreadsheet_id"],
                         chart_id=chart_id,
                         position=chart_spec.get("position"),
+                        linking_mode=link_mode,
                     )
                 )
 

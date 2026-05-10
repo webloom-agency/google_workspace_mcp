@@ -9,8 +9,21 @@ when `unit` is set explicitly on the magnitude objects.
 """
 from __future__ import annotations
 
+import logging
+import re
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# Slides ReplaceImageRequest.imageReplaceMethod — only these are valid.
+_VALID_IMAGE_REPLACE_METHODS = frozenset(
+    {
+        "IMAGE_REPLACE_METHOD_UNSPECIFIED",
+        "CENTER_INSIDE",
+        "CENTER_CROP",
+    }
+)
 
 # Google Slides predefined layout names. Used as fallbacks and aliases.
 PREDEFINED_LAYOUTS = {
@@ -263,6 +276,61 @@ def _transform(x_pt: float, y_pt: float) -> Dict[str, Any]:
         "translateY": float(y_pt),
         "unit": "PT",
     }
+
+
+def _normalize_image_replace_method(raw: Any) -> str:
+    """Map user/LLM input to a valid Slides `imageReplaceMethod` enum string."""
+    if raw is None or raw == "":
+        return "CENTER_INSIDE"
+    s = str(raw).strip().upper().replace("-", "_")
+    # Common shorthand from agents / UI copy.
+    aliases = {
+        "CENTER_INSIDE": "CENTER_INSIDE",
+        "CENTER_CROP": "CENTER_CROP",
+        "CROP": "CENTER_CROP",
+        "FIT": "CENTER_INSIDE",
+        "CONTAIN": "CENTER_INSIDE",
+        "COVER": "CENTER_CROP",
+        "IMAGE_REPLACE_METHOD_UNSPECIFIED": "IMAGE_REPLACE_METHOD_UNSPECIFIED",
+        "UNSPECIFIED": "IMAGE_REPLACE_METHOD_UNSPECIFIED",
+    }
+    if s in aliases:
+        return aliases[s]
+    if s in _VALID_IMAGE_REPLACE_METHODS:
+        return s
+    logger.warning(
+        f"[_builders] Invalid imageReplaceMethod {raw!r} — falling back to CENTER_INSIDE. "
+        f"Valid: CENTER_INSIDE, CENTER_CROP."
+    )
+    return "CENTER_INSIDE"
+
+
+def _maybe_warn_non_public_image_url(url: str) -> None:
+    """Best-effort hint when a URL is unlikely to be fetchable by Google's
+    image-retrieval servers (which never send cookies or auth headers).
+
+    Slides `replaceImage` succeeds at the API layer even when the fetch
+    fails — the slide then shows a broken-image glyph in the editor. This
+    log line is the only server-side signal short of opening the deck.
+    """
+    if not url:
+        return
+    u = url.lower()
+    risky = (
+        "/api/file/" in u,
+        "auth=" in u,
+        "token=" in u,
+        "localhost" in u,
+        re.match(r"https?://10\.", u) is not None,
+        re.match(r"https?://192\.168\.", u) is not None,
+    )
+    if any(risky):
+        logger.warning(
+            f"[_builders] Image URL may not be fetchable by Google Slides "
+            f"(no cookies / auth headers): {url[:120]}{'…' if len(url) > 120 else ''}. "
+            f"Use a **public HTTPS URL** (PNG/JPEG/GIF) or a Drive file shared "
+            f"as \"Anyone with the link can view\" with a direct download link."
+        )
 
 
 def _position(spec: Optional[Dict[str, Any]], default: Dict[str, float]) -> Dict[str, float]:
@@ -531,6 +599,7 @@ def build_image_requests(
     url = image_spec.get("url")
     if not url:
         return []
+    _maybe_warn_non_public_image_url(url)
     pos = _position(
         image_spec.get("position"),
         {"x": 60.0, "y": 100.0, "w": DEFAULT_PAGE_W_PT - 120.0, "h": DEFAULT_PAGE_H_PT - 150.0},
@@ -556,9 +625,17 @@ def build_sheets_chart_requests(
     spreadsheet_id: str,
     chart_id: int,
     position: Optional[Dict[str, float]] = None,
-    linking_mode: str = "LINKED",
+    linking_mode: str = "NOT_LINKED_IMAGE",
 ) -> List[Dict[str, Any]]:
-    """Embed a Google Sheets chart on a slide via its chartId."""
+    """Embed a Google Sheets chart on a slide via its chartId.
+
+    `linking_mode` defaults to ``NOT_LINKED_IMAGE`` (static snapshot at embed
+    time). This avoids the common failure mode where ``LINKED`` charts render
+    as a broken placeholder for viewers who cannot access the source
+    spreadsheet, or when Workspace link policies block live chart resolution.
+    Pass ``LINKED`` only when you need live refresh and every deck viewer has
+    read access to the data sheet.
+    """
     pos = _position(
         position,
         {"x": 60.0, "y": 100.0, "w": DEFAULT_PAGE_W_PT - 120.0, "h": DEFAULT_PAGE_H_PT - 150.0},
@@ -952,12 +1029,14 @@ def build_slide_with_placeholders(
     # placeholder image; replaceImage swaps its bitmap for our URL while
     # preserving the placeholder's size, position, and crop.
     for ph_id, spec in image_fill:
-        method = spec.get("method") or "CENTER_INSIDE"
+        url = spec["url"]
+        _maybe_warn_non_public_image_url(url)
+        method = _normalize_image_replace_method(spec.get("method"))
         content_requests.append(
             {
                 "replaceImage": {
                     "imageObjectId": ph_id,
-                    "url": spec["url"],
+                    "url": url,
                     "imageReplaceMethod": method,
                 }
             }
