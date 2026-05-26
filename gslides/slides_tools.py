@@ -35,7 +35,11 @@ async def create_presentation(
     create_folders_if_missing: bool = True,
 ) -> str:
     """
-    Create a new Google Slides presentation, optionally in a specific folder.
+    Create a blank Google Slides presentation, optionally in a specific folder.
+
+    This is the low-level Slides creation primitive. For most automated deck-building
+    workflows, prefer `create_audit_presentation`, which copies a template and builds
+    a full deck from structured JSON.
 
     Args:
         user_google_email (str): The user's Google email address. Required.

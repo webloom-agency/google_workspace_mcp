@@ -96,6 +96,7 @@ forms:
 
 slides:
   core:
+    - create_audit_presentation
     - create_presentation
     - get_presentation
   extended:
