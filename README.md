@@ -772,8 +772,8 @@ cp .env.oauth21 .env
 
 | Tool | Tier | Description |
 |------|------|-------------|
-| `create_presentation` | **Core** | Create new presentations |
-| `create_audit_presentation` | **Core** | Build a full branded deck from one structured JSON payload (template + tables + images + native Sheets charts + speaker notes). [Schema & example below.](#create_audit_presentation-build-a-full-deck-from-structured-json) |
+| `create_audit_presentation` | **Core** | Default deck creation tool. Build a full branded deck from one structured JSON payload (template + tables + images + native Sheets charts + speaker notes). [Schema & example below.](#create_audit_presentation-build-a-full-deck-from-structured-json) |
+| `create_presentation` | **Core** | Create a blank presentation and optionally move it to a folder (low-level primitive). |
 | `get_presentation` | **Core** | Retrieve presentation details |
 | `batch_update_presentation` | Extended | Apply multiple updates |
 | `get_page` | Extended | Get specific slide information |
@@ -850,8 +850,9 @@ cp .env.oauth21 .env
 
 ### `create_audit_presentation`: build a full deck from structured JSON
 
-Designed for workflows (n8n, custom scripts, agents) that already produce structured audit data
-and need to ship it as a branded Google Slides deck without writing any Slides API code.
+This is the default/recommended Slides creation tool. It is designed for workflows (n8n,
+custom scripts, agents) that already produce structured audit data and need to ship it as a
+branded Google Slides deck without writing any Slides API code.
 
 > 💡 **Driving this from an LLM agent?** A copy-pasteable system prompt that locks the agent to the canonical webloom layout vocabulary and JSON conventions lives at [`gslides/AGENT_SYSTEM_PROMPT.md`](gslides/AGENT_SYSTEM_PROMPT.md). Paste it into Claude / OpenAI / Gemini / n8n's *System Message* and the agent will reliably emit valid `create_audit_presentation` payloads.
 
@@ -1119,6 +1120,12 @@ Response (JSON string):
 - > 150 slides: split.
 
 On any failure after the template copy, the tool best-effort deletes the partial deck and data sheet so retries don't accumulate orphans.
+
+#### `create_presentation`: create a blank deck
+
+Use `create_presentation` only when you explicitly want an empty Google Slides file that you
+will populate later via other tools or manually. For most generated decks, prefer
+`create_audit_presentation`.
 
 ---
 
