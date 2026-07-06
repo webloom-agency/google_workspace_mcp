@@ -232,21 +232,39 @@ def _col_letter_to_idx(letters: str) -> int:
 def _resolve_column_selection(
     columns: Union[str, List[Union[str, int]], None],
     header_row: List[Any],
-) -> Optional[List[int]]:
+    ignore_missing: bool = False,
+    n_cols: Optional[int] = None,
+) -> tuple:
     """
-    Resolve a user-supplied column projection into a sorted, de-duplicated list of
-    0-based column indices.
+    Resolve a user-supplied column projection into a de-duplicated list of 0-based
+    column indices (ordered as requested).
 
     Each token may be:
-      - a header name present in `header_row` (exact match, tried first),
+      - a header name present in `header_row` (exact match tried first, then
+        case-insensitive so "cpc" matches a "CPC" header),
       - an A1-style column letter (e.g. "A", "CV"),
       - an integer / numeric string treated as a 1-based column number.
 
-    Returns None when no projection is requested (columns is None/empty), meaning
-    "keep all columns".
+    Disambiguating names from letters: a bare alphabetic token is treated as a
+    column letter only when it resolves to a column that actually exists (index
+    < `n_cols`, when known). Otherwise it is considered a (missing) header name.
+    This keeps a header like "cpc" from being silently read as column "CPC"
+    (index 2237) when that header is absent.
+
+    Args:
+        ignore_missing: When True, unknown/out-of-range selectors are skipped
+            instead of raising, so callers can safely over-request columns.
+        n_cols: Effective number of columns available (used to range-check letter
+            selectors). None disables the range check.
+
+    Returns:
+        (indices, skipped): `indices` is None when no projection is requested
+        (columns is None/empty), meaning "keep all columns"; otherwise a list of
+        0-based indices. `skipped` is the list of selector tokens that could not
+        be resolved (always empty unless ignore_missing=True).
     """
     if columns is None:
-        return None
+        return None, []
 
     if isinstance(columns, str):
         tokens: List[Union[str, int]] = [t.strip() for t in columns.split(",")]
@@ -259,33 +277,80 @@ def _resolve_column_selection(
 
     tokens = [t for t in tokens if not (isinstance(t, str) and t == "")]
     if not tokens:
-        return None
+        return None, []
 
     header_lookup = {str(name): i for i, name in enumerate(header_row)}
+    header_lookup_ci: Dict[str, int] = {}
+    for i, name in enumerate(header_row):
+        key = str(name).strip().lower()
+        # First occurrence wins so duplicate headers map to their leftmost column.
+        header_lookup_ci.setdefault(key, i)
+
+    def _in_range(idx: int) -> bool:
+        return n_cols is None or 0 <= idx < n_cols
 
     indices: List[int] = []
+    skipped: List[str] = []
+
+    def _reject(token_repr: str, reason: str):
+        if ignore_missing:
+            skipped.append(token_repr)
+            logger.warning(
+                f"[read_sheet_values] Skipping column selector {token_repr!r}: {reason}."
+            )
+        else:
+            raise ValueError(
+                f"Column selector {token_repr!r} is not usable: {reason}. "
+                f"Pass ignore_missing_columns=True to skip unknown columns instead."
+            )
+
     for tok in tokens:
+        # Explicit integer -> 1-based column number.
         if isinstance(tok, int):
             if tok < 1:
-                raise ValueError(f"Column number must be >= 1, got {tok}")
+                _reject(str(tok), "column number must be >= 1")
+                continue
             indices.append(tok - 1)
             continue
 
         tok_str = str(tok).strip()
+
+        # 1) Exact header name.
         if tok_str in header_lookup:
             indices.append(header_lookup[tok_str])
-        elif tok_str.isdigit():
+            continue
+
+        # 2) Case-insensitive header name (handles cpc/CPC, competition/Competition).
+        ci = header_lookup_ci.get(tok_str.lower())
+        if ci is not None:
+            indices.append(ci)
+            continue
+
+        # 3) Numeric string -> 1-based column number.
+        if tok_str.isdigit():
             num = int(tok_str)
             if num < 1:
-                raise ValueError(f"Column number must be >= 1, got {num}")
+                _reject(tok_str, "column number must be >= 1")
+                continue
             indices.append(num - 1)
-        elif tok_str.isalpha():
-            indices.append(_col_letter_to_idx(tok_str))
-        else:
-            raise ValueError(
-                f"Column selector {tok_str!r} is not a known header name, "
-                f"column letter, or column number."
-            )
+            continue
+
+        # 4) Column letters, but only if they point to an existing column. This
+        #    avoids interpreting a missing header name (e.g. "cpc") as a far-off
+        #    column reference.
+        if tok_str.isalpha():
+            letter_idx = _col_letter_to_idx(tok_str)
+            if _in_range(letter_idx):
+                indices.append(letter_idx)
+            else:
+                _reject(
+                    tok_str,
+                    "not a known header name and out of column range as a letter reference",
+                )
+            continue
+
+        # 5) Anything else is unresolvable.
+        _reject(tok_str, "not a known header name, column letter, or column number")
 
     # De-duplicate while preserving the caller's ordering.
     seen = set()
@@ -294,7 +359,7 @@ def _resolve_column_selection(
         if i not in seen:
             seen.add(i)
             ordered.append(i)
-    return ordered
+    return ordered, skipped
 
 
 # Friendly aliases for column number formats. Mapped to (Sheets API type, default pattern).
@@ -468,6 +533,7 @@ async def read_sheet_values(
     max_display_rows: int = 50,
     output_format: str = "text",
     columns: Optional[Union[str, List[Union[str, int]]]] = None,
+    ignore_missing_columns: bool = False,
     row_offset: int = 0,
     row_limit: Optional[int] = None,
     header_row: bool = True,
@@ -498,9 +564,17 @@ async def read_sheet_values(
             - "jsonl": one JSON array per line (no wrapping object); streamable.
         columns (Optional[str | list]): Column projection. Accepts a comma-separated
             string or a list. Each token may be a header name (matched against the first
-            returned row when header_row=True), an A1 column letter (e.g. "A", "CV"), or a
-            1-based column number. Only the selected columns are returned. This is the
+            returned row when header_row=True; matching is case-insensitive, so "cpc"
+            matches a "CPC" header), an A1 column letter (e.g. "A", "CV"), or a 1-based
+            column number. Only the selected columns are returned. This is the
             highest-leverage way to cut payload size on wide sheets.
+        ignore_missing_columns (bool): When False (default), an unknown column
+            selector raises an error (catches typos). When True, unknown selectors are
+            skipped instead — making it safe to over-request columns that may or may not
+            exist. Skipped selectors are always logged (warning); they are also surfaced
+            as "skipped_columns" in the json envelope and as a trailing note in text
+            output. csv/jsonl output is kept pure (data only) for clean downstream
+            parsing. Defaults to False.
         row_offset (int): Number of data rows to skip (after the header, when
             header_row=True). Combine with row_limit for pagination. Defaults to 0.
         row_limit (Optional[int]): Maximum number of data rows to return (after applying
@@ -516,6 +590,7 @@ async def read_sheet_values(
     logger.info(
         f"[read_sheet_values] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, "
         f"Range: {range_name}, Format: {output_format}, Columns: {columns}, "
+        f"IgnoreMissingColumns: {ignore_missing_columns}, "
         f"RowOffset: {row_offset}, RowLimit: {row_limit}, Render: {value_render_option}"
     )
 
@@ -549,6 +624,7 @@ async def read_sheet_values(
                     "total_rows": 0,
                     "returned_rows": 0,
                     "row_offset": row_offset,
+                    "skipped_columns": [],
                     "headers": [],
                     "rows": [],
                 }
@@ -567,12 +643,22 @@ async def read_sheet_values(
         header = []
         data_rows = values
 
+    # Effective column count (used to disambiguate letter selectors from missing
+    # header names). Based on the header and the first data row, whichever is wider.
+    base_width_candidates = [len(header)] + [len(r) for r in data_rows[:1]]
+    base_n_cols = max(base_width_candidates) if base_width_candidates else 0
+
     # Column projection. When header_row is False we can still project by letter/number.
-    selected_indices = _resolve_column_selection(columns, header)
+    selected_indices, skipped_columns = _resolve_column_selection(
+        columns,
+        header,
+        ignore_missing=ignore_missing_columns,
+        n_cols=base_n_cols or None,
+    )
 
     # Normalize row width to the widest of (header, selection targets) so projection and
     # padding are consistent even for ragged rows returned by the API.
-    width_candidates = [len(header)] + [len(r) for r in data_rows[:1]]
+    width_candidates = list(base_width_candidates)
     if selected_indices:
         width_candidates.append(max(selected_indices) + 1)
     row_width = max(width_candidates) if width_candidates else 0
@@ -630,6 +716,7 @@ async def read_sheet_values(
                 "row_offset": start,
                 "has_more": has_more,
                 "next_row_offset": end if has_more else None,
+                "skipped_columns": skipped_columns,
                 "headers": projected_header,
                 "rows": projected_rows,
             },
@@ -650,6 +737,7 @@ async def read_sheet_values(
         f"in spreadsheet {spreadsheet_id} for {user_google_email} "
         f"(total data rows: {total_data_rows}, offset: {start}"
         + (f", more available from offset {end}" if has_more else "")
+        + (f", skipped columns: {skipped_columns}" if skipped_columns else "")
         + "):\n"
     )
 
