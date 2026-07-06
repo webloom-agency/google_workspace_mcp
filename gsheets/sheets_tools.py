@@ -6,6 +6,8 @@ This module provides MCP tools for interacting with Google Sheets API.
 
 import logging
 import asyncio
+import csv
+import io
 import json
 import re
 from typing import List, Optional, Union, Dict, Any
@@ -216,6 +218,85 @@ def _col_idx_to_letter(idx: int) -> str:
     return letters
 
 
+def _col_letter_to_idx(letters: str) -> int:
+    """Convert A1-style column letters to a 0-based column index (A->0, Z->25, AA->26)."""
+    letters = letters.strip().upper()
+    if not letters or not letters.isalpha():
+        raise ValueError(f"Invalid column letters: {letters!r}")
+    idx = 0
+    for ch in letters:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def _resolve_column_selection(
+    columns: Union[str, List[Union[str, int]], None],
+    header_row: List[Any],
+) -> Optional[List[int]]:
+    """
+    Resolve a user-supplied column projection into a sorted, de-duplicated list of
+    0-based column indices.
+
+    Each token may be:
+      - a header name present in `header_row` (exact match, tried first),
+      - an A1-style column letter (e.g. "A", "CV"),
+      - an integer / numeric string treated as a 1-based column number.
+
+    Returns None when no projection is requested (columns is None/empty), meaning
+    "keep all columns".
+    """
+    if columns is None:
+        return None
+
+    if isinstance(columns, str):
+        tokens: List[Union[str, int]] = [t.strip() for t in columns.split(",")]
+    elif isinstance(columns, (list, tuple)):
+        tokens = list(columns)
+    else:
+        raise ValueError(
+            f"'columns' must be a comma-separated string or a list, got {type(columns).__name__}"
+        )
+
+    tokens = [t for t in tokens if not (isinstance(t, str) and t == "")]
+    if not tokens:
+        return None
+
+    header_lookup = {str(name): i for i, name in enumerate(header_row)}
+
+    indices: List[int] = []
+    for tok in tokens:
+        if isinstance(tok, int):
+            if tok < 1:
+                raise ValueError(f"Column number must be >= 1, got {tok}")
+            indices.append(tok - 1)
+            continue
+
+        tok_str = str(tok).strip()
+        if tok_str in header_lookup:
+            indices.append(header_lookup[tok_str])
+        elif tok_str.isdigit():
+            num = int(tok_str)
+            if num < 1:
+                raise ValueError(f"Column number must be >= 1, got {num}")
+            indices.append(num - 1)
+        elif tok_str.isalpha():
+            indices.append(_col_letter_to_idx(tok_str))
+        else:
+            raise ValueError(
+                f"Column selector {tok_str!r} is not a known header name, "
+                f"column letter, or column number."
+            )
+
+    # De-duplicate while preserving the caller's ordering.
+    seen = set()
+    ordered: List[int] = []
+    for i in indices:
+        if i not in seen:
+            seen.add(i)
+            ordered.append(i)
+    return ordered
+
+
 # Friendly aliases for column number formats. Mapped to (Sheets API type, default pattern).
 _NUMBER_FORMAT_ALIASES: Dict[str, tuple] = {
     "TEXT":      ("TEXT",      "@"),
@@ -385,50 +466,199 @@ async def read_sheet_values(
     spreadsheet_id: str,
     range_name: str = "A1:Z1000",
     max_display_rows: int = 50,
+    output_format: str = "text",
+    columns: Optional[Union[str, List[Union[str, int]]]] = None,
+    row_offset: int = 0,
+    row_limit: Optional[int] = None,
+    header_row: bool = True,
+    value_render_option: str = "FORMATTED_VALUE",
 ) -> str:
     """
     Reads values from a specific range in a Google Sheet.
+
+    Supports compact output formats, column projection, and row pagination so large
+    ranges can be consumed without materializing a huge pretty-printed blob (which is
+    expensive in both this process and any downstream consumer that re-parses it).
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         spreadsheet_id (str): The ID of the spreadsheet. Required.
         range_name (str): The range to read (e.g., "Sheet1!A1:D10", "A1:D10"). Defaults to "A1:Z1000".
-        max_display_rows (int): Maximum number of rows to display in output. Set to -1 for unlimited. Defaults to 50.
+            Prefer bounding the range to the columns/rows you actually need instead of
+            wildly wide ranges like "A1:ZZ10000".
+        max_display_rows (int): For output_format="text" only, the maximum number of
+            rows to render before truncating. Set to -1 for unlimited. Defaults to 50.
+            Ignored by "csv"/"json"/"jsonl" (use row_limit to bound those).
+        output_format (str): One of:
+            - "text" (default): human-readable "Row N: [...]" listing (backward compatible).
+            - "csv": compact RFC-4180 CSV (header line + data rows). Best for feeding a
+              downstream parser without a bespoke text parser.
+            - "json": a structured object {"headers", "rows", "total_rows", ...} where
+              rows are arrays. Compact and directly machine-readable.
+            - "jsonl": one JSON array per line (no wrapping object); streamable.
+        columns (Optional[str | list]): Column projection. Accepts a comma-separated
+            string or a list. Each token may be a header name (matched against the first
+            returned row when header_row=True), an A1 column letter (e.g. "A", "CV"), or a
+            1-based column number. Only the selected columns are returned. This is the
+            highest-leverage way to cut payload size on wide sheets.
+        row_offset (int): Number of data rows to skip (after the header, when
+            header_row=True). Combine with row_limit for pagination. Defaults to 0.
+        row_limit (Optional[int]): Maximum number of data rows to return (after applying
+            row_offset). None means no limit. Defaults to None.
+        header_row (bool): Whether the first row of the range is treated as a header
+            (used for column-name projection and for csv/json headers). Defaults to True.
+        value_render_option (str): How values are rendered by the Sheets API:
+            "FORMATTED_VALUE" (default), "UNFORMATTED_VALUE", or "FORMULA".
 
     Returns:
-        str: The formatted values from the specified range.
+        str: The values from the specified range, formatted per output_format.
     """
-    logger.info(f"[read_sheet_values] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Range: {range_name}, MaxDisplay: {max_display_rows}")
+    logger.info(
+        f"[read_sheet_values] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, "
+        f"Range: {range_name}, Format: {output_format}, Columns: {columns}, "
+        f"RowOffset: {row_offset}, RowLimit: {row_limit}, Render: {value_render_option}"
+    )
+
+    fmt = (output_format or "text").strip().lower()
+    if fmt not in ("text", "csv", "json", "jsonl"):
+        raise Exception(
+            f"Invalid output_format '{output_format}'. Expected one of: text, csv, json, jsonl."
+        )
+    if row_offset < 0:
+        raise Exception(f"row_offset must be >= 0, got {row_offset}.")
+    if row_limit is not None and row_limit < 0:
+        raise Exception(f"row_limit must be >= 0 or None, got {row_limit}.")
 
     result = await asyncio.to_thread(
         service.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=range_name)
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueRenderOption=value_render_option,
+        )
         .execute
     )
 
     values = result.get("values", [])
     if not values:
+        if fmt == "json":
+            return json.dumps(
+                {
+                    "range": range_name,
+                    "total_rows": 0,
+                    "returned_rows": 0,
+                    "row_offset": row_offset,
+                    "headers": [],
+                    "rows": [],
+                }
+            )
+        if fmt == "jsonl":
+            return ""
+        if fmt == "csv":
+            return ""
         return f"No data found in range '{range_name}' for {user_google_email}."
 
-    # Format the output as a readable table
-    formatted_rows = []
-    for i, row in enumerate(values, 1):
-        # Pad row with empty strings to show structure
-        padded_row = row + [""] * max(0, len(values[0]) - len(row)) if values else row
-        formatted_rows.append(f"Row {i:2d}: {padded_row}")
+    # Split header from data rows (when applicable).
+    if header_row:
+        header = values[0]
+        data_rows = values[1:]
+    else:
+        header = []
+        data_rows = values
 
-    # Determine how many rows to show
-    display_limit = len(formatted_rows) if max_display_rows == -1 else max_display_rows
-    show_all = max_display_rows == -1 or len(formatted_rows) <= max_display_rows
-    
-    text_output = (
-        f"Successfully read {len(values)} rows from range '{range_name}' in spreadsheet {spreadsheet_id} for {user_google_email}:\n"
-        + "\n".join(formatted_rows[:display_limit])
-        + ("" if show_all else f"\n... and {len(values) - display_limit} more rows")
+    # Column projection. When header_row is False we can still project by letter/number.
+    selected_indices = _resolve_column_selection(columns, header)
+
+    # Normalize row width to the widest of (header, selection targets) so projection and
+    # padding are consistent even for ragged rows returned by the API.
+    width_candidates = [len(header)] + [len(r) for r in data_rows[:1]]
+    if selected_indices:
+        width_candidates.append(max(selected_indices) + 1)
+    row_width = max(width_candidates) if width_candidates else 0
+
+    def _project(row: List[Any]) -> List[Any]:
+        padded = row + [""] * max(0, row_width - len(row))
+        if selected_indices is None:
+            return padded
+        return [padded[i] if i < len(padded) else "" for i in selected_indices]
+
+    total_data_rows = len(data_rows)
+
+    # Pagination over data rows.
+    start = min(row_offset, total_data_rows)
+    end = total_data_rows if row_limit is None else min(start + row_limit, total_data_rows)
+    page_rows = data_rows[start:end]
+
+    projected_header = _project(header) if header else []
+    projected_rows = [_project(r) for r in page_rows]
+
+    returned_rows = len(projected_rows)
+    has_more = end < total_data_rows
+
+    logger.info(
+        f"[read_sheet_values] Read {len(values)} raw rows; returning {returned_rows} data rows "
+        f"(offset={start}, has_more={has_more}) as {fmt} for {user_google_email}."
     )
 
-    logger.info(f"Successfully read {len(values)} rows for {user_google_email}.")
+    def _cell_to_str(cell: Any) -> str:
+        return "" if cell is None else str(cell)
+
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        if header:
+            writer.writerow([_cell_to_str(c) for c in projected_header])
+        for r in projected_rows:
+            writer.writerow([_cell_to_str(c) for c in r])
+        return buf.getvalue()
+
+    if fmt == "jsonl":
+        lines = []
+        if header:
+            lines.append(json.dumps(projected_header, ensure_ascii=False))
+        for r in projected_rows:
+            lines.append(json.dumps(r, ensure_ascii=False))
+        return "\n".join(lines)
+
+    if fmt == "json":
+        return json.dumps(
+            {
+                "range": range_name,
+                "total_rows": total_data_rows,
+                "returned_rows": returned_rows,
+                "row_offset": start,
+                "has_more": has_more,
+                "next_row_offset": end if has_more else None,
+                "headers": projected_header,
+                "rows": projected_rows,
+            },
+            ensure_ascii=False,
+        )
+
+    # Default: backward-compatible human-readable text. Header (when present) is listed
+    # first, followed by the projected data-row page, using legacy "Row N" numbering.
+    listing_rows = ([projected_header] if header else []) + projected_rows
+
+    formatted_rows = [f"Row {i:2d}: {row}" for i, row in enumerate(listing_rows, 1)]
+
+    display_limit = len(formatted_rows) if max_display_rows == -1 else max_display_rows
+    show_all = max_display_rows == -1 or len(formatted_rows) <= max_display_rows
+
+    summary = (
+        f"Successfully read {returned_rows} data row(s) from range '{range_name}' "
+        f"in spreadsheet {spreadsheet_id} for {user_google_email} "
+        f"(total data rows: {total_data_rows}, offset: {start}"
+        + (f", more available from offset {end}" if has_more else "")
+        + "):\n"
+    )
+
+    text_output = (
+        summary
+        + "\n".join(formatted_rows[:display_limit])
+        + ("" if show_all else f"\n... and {len(formatted_rows) - display_limit} more rows")
+    )
+
     return text_output
 
 

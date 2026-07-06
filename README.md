@@ -756,7 +756,7 @@ cp .env.oauth21 .env
 
 | Tool | Tier | Description |
 |------|------|-------------|
-| `read_sheet_values` | **Core** | Read cell ranges |
+| `read_sheet_values` | **Core** | Read cell ranges (csv/json output, column projection, row pagination) |
 | `modify_sheet_values` | **Core** | Write/update/clear cells |
 | `create_spreadsheet` | **Core** | Create new spreadsheets |
 | `list_spreadsheets` | Extended | List accessible spreadsheets |
