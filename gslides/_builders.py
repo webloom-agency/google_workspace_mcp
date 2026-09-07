@@ -511,6 +511,10 @@ def build_table_requests(
         "header_style": {...},  # optional textStyle for the header row
         "body_style": {...},    # optional textStyle for body rows
       }
+
+    Each cell may be a plain string/number, or a dict:
+      {"text": "/blog/foo", "link": "https://example.com/blog/foo"}
+    so the visible label can stay short/relative while remaining clickable.
     """
     headers = table_spec.get("headers") or []
     body_rows = table_spec.get("rows") or []
@@ -551,10 +555,19 @@ def build_table_requests(
     header_style = table_spec.get("header_style") or {"bold": True}
     body_style = table_spec.get("body_style")
 
+    def _cell_parts(value: Any) -> Tuple[str, Optional[str]]:
+        if isinstance(value, dict):
+            text = value.get("text")
+            if text is None:
+                text = value.get("label") or value.get("value") or ""
+            link = value.get("link") or value.get("url") or value.get("href")
+            return ("" if text is None else str(text), str(link) if link else None)
+        return ("" if value is None else str(value), None)
+
     for r_idx, row in enumerate(all_rows):
         for c_idx in range(n_cols):
             value = row[c_idx] if c_idx < len(row) else ""
-            text = "" if value is None else str(value)
+            text, link = _cell_parts(value)
             if not text:
                 continue
             requests.append(
@@ -567,7 +580,9 @@ def build_table_requests(
                     }
                 }
             )
-            cell_style = header_style if (headers and r_idx == 0) else body_style
+            cell_style = dict(header_style if (headers and r_idx == 0) else (body_style or {}))
+            if link:
+                cell_style["link"] = {"url": link}
             if cell_style:
                 requests.append(
                     {

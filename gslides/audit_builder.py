@@ -66,7 +66,7 @@ _CAPACITY_LIMITS = {
     "body_two_columns": {"soft": 250, "hard": 400},
     "table_rows": {"soft": 8, "hard": 10},
     "table_cols": {"soft": 5, "hard": 6},
-    "table_cell": {"soft": 50, "hard": 80},
+    "table_cell": {"soft": 120, "hard": 500},
 }
 
 _LAYOUT_BODY_LIMIT = {
@@ -205,7 +205,7 @@ def _audit_slide_capacity(
                 "SOFT",
                 f"table has {n_cols} cols (soft target: {clim['soft']}).",
             ))
-        # Per-cell text length.
+        # Per-cell text length (plain string or {"text": "...", "link": "..."}).
         cell_lim = _CAPACITY_LIMITS["table_cell"]
         long_cells: List[Tuple[int, int, int]] = []
         for r_i, row in enumerate(rows):
@@ -214,7 +214,10 @@ def _audit_slide_capacity(
             for c_i, cell in enumerate(row):
                 if cell is None:
                     continue
-                cell_len = len(str(cell))
+                if isinstance(cell, dict):
+                    cell_len = len(str(cell.get("text") or cell.get("label") or ""))
+                else:
+                    cell_len = len(str(cell))
                 if cell_len > cell_lim["hard"]:
                     long_cells.append((r_i, c_i, cell_len))
         if long_cells:
@@ -224,8 +227,8 @@ def _audit_slide_capacity(
                 f"{len(long_cells)} table cell(s) exceed "
                 f"{cell_lim['hard']} chars (e.g. row {example[0] + 1} col "
                 f"{example[1] + 1}: {example[2]} chars). Will wrap "
-                f"unpredictably — shorten to <{cell_lim['soft']} chars or "
-                f"move detail to the body.",
+                f"unpredictably — shorten to <{cell_lim['soft']} chars, "
+                f"use {{text, link}} cells, or move detail to the body.",
             ))
 
     return findings
