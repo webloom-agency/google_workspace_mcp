@@ -161,12 +161,16 @@ def _repair_json_string(json_str: str, context: str = "") -> Any:
         json.JSONDecodeError: If JSON cannot be repaired after all attempts.
     """
     # 1. Try parsing as-is
+    # NOTE: PEP 3110 deletes the `except ... as name` binding when leaving the
+    # except block, so we must copy it to a local that survives for the final raise.
+    first_error: Optional[json.JSONDecodeError] = None
     try:
         return json.loads(json_str)
-    except json.JSONDecodeError as first_error:
+    except json.JSONDecodeError as e:
+        first_error = e
         logger.warning(
-            f"[{context}] Initial JSON parse failed at pos {first_error.pos}: "
-            f"{first_error.msg}. Attempting repair..."
+            f"[{context}] Initial JSON parse failed at pos {e.pos}: "
+            f"{e.msg}. Attempting repair..."
         )
 
     # 2. Remove trailing commas and retry
@@ -201,7 +205,84 @@ def _repair_json_string(json_str: str, context: str = "") -> Any:
         f"[{context}] JSON repair failed after removing trailing commas and "
         f"{insertions} comma insertion(s). Original error: {first_error}"
     )
+    assert first_error is not None
     raise first_error
+
+
+def _quote_sheet_name(sheet_name: str) -> str:
+    """
+    Quote a sheet title for A1 notation when required by the Sheets API.
+
+    Names with spaces, punctuation, or non-ASCII characters (e.g. "Requêtes GSC")
+    must be wrapped in single quotes. Internal single quotes are escaped by doubling.
+    Already-quoted names are returned unchanged.
+    """
+    name = _unquote_sheet_name(sheet_name)
+    if not name:
+        return name
+    # Simple identifiers need no quoting
+    if re.fullmatch(r"[A-Za-z0-9_]+", name):
+        return name
+    return "'" + name.replace("'", "''") + "'"
+
+
+def _unquote_sheet_name(sheet_name: str) -> str:
+    """Strip surrounding A1 quotes from a sheet title ('' → ')."""
+    name = (sheet_name or "").strip()
+    if len(name) >= 2 and name.startswith("'") and name.endswith("'"):
+        return name[1:-1].replace("''", "'")
+    return name
+
+
+def _a1_range(sheet_name: str, cell_range: str) -> str:
+    """Build a properly quoted A1 range: Sheet1!A1 or 'Requêtes GSC'!A1:Z10."""
+    return f"{_quote_sheet_name(sheet_name)}!{cell_range}"
+
+
+def _normalize_a1_range(range_name: str) -> str:
+    """
+    Ensure any sheet prefix in an A1 range is quoted when required.
+
+    Accepts both unquoted (`Requêtes GSC!A1`) and quoted (`'Requêtes GSC'!A1`) forms.
+    Bare sheet names that need quoting (spaces/accents) are quoted; pure cell refs
+    like `A1:Z10` are left unchanged.
+    """
+    if not range_name:
+        return range_name
+
+    s = range_name.strip()
+    if "!" not in s:
+        # Cell-only ref (A1 / A1:Z10) vs bare sheet title
+        if re.fullmatch(r"[A-Za-z]+\d*(?::[A-Za-z]+\d*)?", s):
+            return s
+        return _quote_sheet_name(s)
+
+    sheet: Optional[str] = None
+    cells: Optional[str] = None
+
+    if s.startswith("'"):
+        # Parse quoted sheet name with '' escapes
+        i = 1
+        while i < len(s):
+            if s[i] == "'":
+                if i + 1 < len(s) and s[i + 1] == "'":
+                    i += 2
+                    continue
+                sheet = s[1:i].replace("''", "'")
+                rest = s[i + 1 :]
+                if rest.startswith("!"):
+                    cells = rest[1:]
+                else:
+                    cells = rest
+                break
+            i += 1
+
+    if sheet is None:
+        sheet, _, cells = s.partition("!")
+
+    if not cells:
+        return range_name
+    return _a1_range(sheet, cells)
 
 
 def _col_idx_to_letter(idx: int) -> str:
@@ -604,6 +685,8 @@ async def read_sheet_values(
     if row_limit is not None and row_limit < 0:
         raise Exception(f"row_limit must be >= 0 or None, got {row_limit}.")
 
+    range_name = _normalize_a1_range(range_name)
+
     result = await asyncio.to_thread(
         service.spreadsheets()
         .values()
@@ -768,7 +851,8 @@ async def modify_sheet_values(
     Args:
         user_google_email (str): The user's Google email address. Required.
         spreadsheet_id (str): The ID of the spreadsheet. Required.
-        range_name (str): The range to modify (e.g., "Sheet1!A1:D10", "A1:D10"). Required.
+        range_name (str): The range to modify (e.g., "Sheet1!A1:D10", "A1:D10",
+            "'Requêtes GSC'!A1"). Sheet names with spaces/accents are auto-quoted. Required.
         values (Optional[Union[str, List[List[Any]]]]): 2D array of values to write/update. Can be a JSON string or Python list. Accepts any data types (strings, numbers, booleans, null). Required unless clear_values=True.
         value_input_option (str): How to interpret input values ("RAW" or "USER_ENTERED"). Defaults to "USER_ENTERED".
         clear_values (bool): If True, clears the range instead of writing values. Defaults to False.
@@ -777,6 +861,7 @@ async def modify_sheet_values(
         str: Confirmation message of the successful modification operation.
     """
     operation = "clear" if clear_values else "write"
+    range_name = _normalize_a1_range(range_name)
     logger.info(f"[modify_sheet_values] Invoked. Operation: {operation}, Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Range: {range_name}")
 
     # Parse values if it's a JSON string (MCP passes parameters as JSON strings)
@@ -886,15 +971,19 @@ async def modify_sheet_values(
             # For large datasets, chunk the data
             logger.info(f"[modify_sheet_values] Large dataset detected ({total_rows} rows). Using chunked update.")
             
-            # Parse the range to get sheet name and starting position
-            # Format: "Sheet1!A1:Z100" or "A1:Z100"
-            import re
-            range_match = re.match(r"(?:([^!]+)!)?([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?", range_name)
+            # Parse the range to get sheet name and starting position.
+            # range_name is already normalized (quoted) by _normalize_a1_range.
+            # Format: "Sheet1!A1:Z100", "'Requêtes GSC'!A1", or "A1:Z100"
+            range_match = re.match(
+                r"(?:('(?:[^']|'')+'|[^'!]+)!)?([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?",
+                range_name,
+                re.IGNORECASE,
+            )
             if not range_match:
                 raise Exception(f"Invalid range format: {range_name}. Expected format: 'Sheet1!A1' or 'A1:Z100'")
             
             sheet_prefix = range_match.group(1)
-            start_col = range_match.group(2)
+            start_col = range_match.group(2).upper()
             start_row = int(range_match.group(3))
             
             total_cells_updated = 0
@@ -908,9 +997,9 @@ async def modify_sheet_values(
                 
                 # Calculate the range for this chunk
                 chunk_start_row = start_row + chunk_start
-                chunk_end_row = chunk_start_row + len(chunk) - 1
                 
                 if sheet_prefix:
+                    # sheet_prefix may already include quotes from normalization
                     chunk_range = f"{sheet_prefix}!{start_col}{chunk_start_row}"
                 else:
                     chunk_range = f"{start_col}{chunk_start_row}"
@@ -971,6 +1060,7 @@ async def append_sheet_values(
     logger.info(
         f"[append_sheet_values] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Range: {range_name}"
     )
+    range_name = _normalize_a1_range(range_name)
 
     # Parse values if it's a JSON string (MCP passes parameters as JSON strings)
     if values is not None and isinstance(values, str):
@@ -1188,6 +1278,8 @@ async def append_rows_by_headers(
     logger.info(
         f"[append_rows_by_headers] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Sheet: {sheet_name}"
     )
+    # Title lookups / addSheet need the raw title; A1 helpers re-quote as needed.
+    sheet_name = _unquote_sheet_name(sheet_name)
 
     # Parse rows if provided as JSON string (with automatic repair of common LLM errors)
     if rows is not None and isinstance(rows, str):
@@ -1285,7 +1377,7 @@ async def append_rows_by_headers(
         return await asyncio.to_thread(
             service.spreadsheets()
             .values()
-            .get(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!1:1")
+            .get(spreadsheetId=spreadsheet_id, range=_a1_range(sheet_name, "1:1"))
             .execute
         )
 
@@ -1345,7 +1437,7 @@ async def append_rows_by_headers(
             .values()
             .update(
                 spreadsheetId=spreadsheet_id,
-                range=f"{sheet_name}!1:1",
+                range=_a1_range(sheet_name, "1:1"),
                 valueInputOption=value_input_option,
                 body={"values": [all_headers]},
             )
@@ -1386,7 +1478,7 @@ async def append_rows_by_headers(
     #     runs can leak into the new write.
     if reset_existing_rows:
         end_col_letter = _col_idx_to_letter(max(len(all_headers) - 1, 0))
-        clear_range = f"{sheet_name}!A2:{end_col_letter}{current_max_rows}"
+        clear_range = _a1_range(sheet_name, f"A2:{end_col_letter}{current_max_rows}")
         logger.info(
             f"[append_rows_by_headers] reset_existing_rows=True — clearing data range {clear_range}"
         )
@@ -1510,7 +1602,7 @@ async def append_rows_by_headers(
     col_a_values = await asyncio.to_thread(
         service.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A:A", majorDimension="ROWS")
+        .get(spreadsheetId=spreadsheet_id, range=_a1_range(sheet_name, "A:A"), majorDimension="ROWS")
         .execute
     )
     existing_rows = len(col_a_values.get("values", [])) if col_a_values.get("values") else 0
@@ -1579,13 +1671,13 @@ async def append_rows_by_headers(
     CHUNK_SIZE = 5000  # rows per request to avoid large payload timeouts
     total_rows_appended = 0
     total_cells_appended = 0
-    last_updated_range = f"{sheet_name}!A{next_row}"
+    last_updated_range = _a1_range(sheet_name, f"A{next_row}")
 
     for start in range(0, len(values_to_append), CHUNK_SIZE):
         chunk = values_to_append[start : start + CHUNK_SIZE]
         # Compute the A1 range for this chunk starting row
         start_row_for_chunk = next_row + total_rows_appended
-        target_range = f"{sheet_name}!A{start_row_for_chunk}"
+        target_range = _a1_range(sheet_name, f"A{start_row_for_chunk}")
 
         update_result = await asyncio.to_thread(
             service.spreadsheets()
@@ -1894,7 +1986,7 @@ async def deduplicate_rows_by_headers(
     header_result = await asyncio.to_thread(
         service.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"{effective_sheet_title}!1:1")
+        .get(spreadsheetId=spreadsheet_id, range=_a1_range(effective_sheet_title, "1:1"))
         .execute
     )
     header_values = header_result.get("values", [])
