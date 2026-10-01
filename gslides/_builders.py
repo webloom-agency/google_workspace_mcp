@@ -605,27 +605,18 @@ def _normalize_table_text_style(
 
     Friendly keys: font_family, font_weight (100–900), font_size, color (#RRGGBB),
     bold, italic. API keys (fontFamily, weightedFontFamily, fontSize, …) pass through.
-    Stale faces like Inter are coerced to Roboto Light.
+
+    Note: Slides has no family named "Roboto Light". That alias is mapped to
+    fontFamily=Roboto + weight=300 so the toolbar shows Roboto Light correctly.
     """
     out: Dict[str, Any] = {}
     src = dict(style or {})
-
-    def _coerce_face(name: Optional[str]) -> Optional[str]:
-        if not name:
-            return None
-        low = str(name).strip().lower()
-        if low.startswith("inter") or low == "roboto":
-            return "Roboto Light"
-        return str(name).strip()
 
     # Friendly → API
     if "font_family" in src and "fontFamily" not in src and "weightedFontFamily" not in src:
         src["fontFamily"] = src.pop("font_family")
     else:
         src.pop("font_family", None)
-    if "font_weight" in src and "weightedFontFamily" not in src:
-        # Defer: applied below once font family is known.
-        pass
     if "font_size" in src and "fontSize" not in src:
         src["fontSize"] = {"magnitude": float(src.pop("font_size")), "unit": "PT"}
     else:
@@ -643,31 +634,31 @@ def _normalize_table_text_style(
             continue
         out[key] = value
 
-    # Prefer explicit brand font_family arg; coerce Inter / bare Roboto.
     family = (
-        _coerce_face(font_family)
-        or _coerce_face(
-            (out.get("weightedFontFamily") or {}).get("fontFamily")
-            or out.get("fontFamily")
-        )
-        or "Roboto Light"
+        (out.get("weightedFontFamily") or {}).get("fontFamily")
+        or out.get("fontFamily")
+        or font_family
     )
-
     weight = src.get("font_weight", font_weight)
-    if weight is None:
-        weight = 300
-    try:
-        weight = int(weight)
-    except (TypeError, ValueError):
-        weight = 300
+    # Friendly alias: "Roboto Light" is not a Slides family name.
+    if family and str(family).strip().lower() in ("roboto light", "robotolight"):
+        family = "Roboto"
+        if weight is None:
+            weight = 300
 
-    # Set BOTH fontFamily and weightedFontFamily (matching) — Slides UI + API
-    # are most reliable when they agree.
-    out["fontFamily"] = str(family)
-    out["weightedFontFamily"] = {
-        "fontFamily": str(family),
-        "weight": weight,
-    }
+    if family and weight is not None:
+        try:
+            weight_i = int(weight)
+        except (TypeError, ValueError):
+            weight_i = 400
+        out["weightedFontFamily"] = {
+            "fontFamily": str(family),
+            "weight": weight_i,
+        }
+        out["fontFamily"] = str(family)
+    elif family:
+        out["fontFamily"] = str(family)
+        out.pop("weightedFontFamily", None)
 
     if font_size_pt is not None and "fontSize" not in out:
         out["fontSize"] = {"magnitude": float(font_size_pt), "unit": "PT"}
@@ -816,7 +807,7 @@ def build_table_requests(
         "column_widths": [120, 100, 420],
         "column_roles": ["label", "metric", "narrative"],  # widths + alignment
         "column_align": ["START", "END", "START"],         # overrides roles
-        "font_family": "Roboto Light",
+        "font_family": "Roboto",
         "font_weight": 300,
         "font_size": 11,
         "row_height": 28,
@@ -888,17 +879,18 @@ def build_table_requests(
     if not (table_spec.get("position") or {}).get("h"):
         pos["h"] = min(auto_h, DEFAULT_PAGE_H_PT - pos["y"] - 20.0)
 
-    font_family = table_spec.get("font_family") or table_spec.get("fontFamily") or "Roboto Light"
-    if str(font_family).strip().lower().startswith("inter") or str(font_family).strip().lower() == "roboto":
-        font_family = "Roboto Light"
+    font_family = table_spec.get("font_family") or table_spec.get("fontFamily")
     font_weight = table_spec.get("font_weight")
     if font_weight is not None:
         try:
             font_weight = int(font_weight)
         except (TypeError, ValueError):
+            font_weight = None
+    # Alias: agent may send "Roboto Light" — Slides needs Roboto + weight 300.
+    if font_family and str(font_family).strip().lower() in ("roboto light", "robotolight"):
+        font_family = "Roboto"
+        if font_weight is None:
             font_weight = 300
-    else:
-        font_weight = 300
     font_size = table_spec.get("font_size")
     font_size = float(font_size) if font_size is not None else _TABLE_DEFAULT_FONT_SIZE_PT
 
@@ -908,7 +900,7 @@ def build_table_requests(
         font_weight=(
             int((table_spec.get("header_style") or {}).get("font_weight"))
             if (table_spec.get("header_style") or {}).get("font_weight") is not None
-            else 300
+            else (400 if font_weight and font_weight < 400 else font_weight)
         ),
         font_size_pt=font_size,
     )

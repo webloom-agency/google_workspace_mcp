@@ -37,25 +37,6 @@ _CHART_POSITION_BY_LAYOUT = {
     "title + chart": {"x": 60.0, "y": 110.0, "w": 600.0, "h": 270.0},
 }
 
-# Stale faces agents / masters still send. Brand face is Roboto Light.
-_STALE_FONT_FAMILIES = frozenset({"inter", "inter tight", "inter variable"})
-_BRAND_FONT = "Roboto Light"
-
-
-def _canonical_brand_font(family: Optional[str]) -> str:
-    """Normalize a font face for tables/titles. Inter / bare Roboto → Roboto Light."""
-    if not family or not str(family).strip():
-        return _BRAND_FONT
-    name = str(family).strip()
-    low = name.lower()
-    if low in _STALE_FONT_FAMILIES or low.startswith("inter"):
-        return _BRAND_FONT
-    # Bare "Roboto" (Regular) is not the audit brand — use Light.
-    if low == "roboto":
-        return _BRAND_FONT
-    return name
-
-
 @dataclass
 class PreprocessResult:
     deck: Dict[str, Any]
@@ -223,6 +204,11 @@ def _text_style_from_defaults(
     style: Dict[str, Any] = {}
     family = text_defaults.get("font_family") or text_defaults.get("fontFamily")
     weight = text_defaults.get("font_weight")
+    # Slides has no "Roboto Light" family — map to Roboto + weight 300.
+    if family and str(family).strip().lower() in ("roboto light", "robotolight"):
+        family = "Roboto"
+        if weight is None:
+            weight = 300
     size_key = "title_font_size" if role == "title" else "body_font_size"
     size = text_defaults.get(size_key)
     if size is None and role == "body":
@@ -269,46 +255,34 @@ def apply_text_defaults(
     explicit_text = isinstance(user_text_defaults, dict) and bool(user_text_defaults)
     text_defaults = dict(user_text_defaults or {})
 
-    raw_brand = (
+    # Agent-owned typography. No brand coercion — pass through what the deck asks for.
+    # Tip: Slides has no "Roboto Light" family name; use font_family="Roboto" +
+    # font_weight=300 (builders also accept the friendly alias).
+    brand_family = (
         text_defaults.get("font_family")
         or (out.get("table_defaults") or {}).get("font_family")
         or (out.get("chart_defaults") or {}).get("font_family")
-        # Do NOT use theme.font_family from master textStyles — those are often
-        # stale explicit faces (e.g. Inter) that override the live Theme UI font
-        # (Roboto Light). Tables can't inherit, so default them below.
     )
-    # Tables / TEXT_BOX overlays cannot inherit the Slides theme font. Default
-    # to Roboto Light (webloom brand). Coerce Inter / bare Roboto from agents.
-    brand_family = _canonical_brand_font(raw_brand if isinstance(raw_brand, str) else None)
-    if raw_brand and str(raw_brand).strip() and brand_family != str(raw_brand).strip():
-        logger.info(
-            "[create_audit_presentation] Coercing font_family %r → %r "
-            "(stale face; brand is Roboto Light)",
-            raw_brand,
-            brand_family,
-        )
-
-    brand_weight = (
-        text_defaults.get("font_weight")
-        if text_defaults.get("font_weight") is not None
-        else 300  # Roboto Light — matches audit decks; ignore stale master weights
-    )
+    brand_weight = text_defaults.get("font_weight")
+    if brand_weight is None:
+        brand_weight = (out.get("table_defaults") or {}).get("font_weight")
+    if brand_family and str(brand_family).strip().lower() in ("roboto light", "robotolight"):
+        brand_family = "Roboto"
+        if brand_weight is None:
+            brand_weight = 300
     body_size = (
         text_defaults.get("body_font_size")
         or text_defaults.get("font_size")
         or theme.body_font_size
-        or 11
     )
 
-    # --- table_defaults: always seed from theme when caller omitted keys ---
+    # --- table_defaults: seed colors; fonts only when the deck asked ---
     table_defaults = dict(out.get("table_defaults") or {})
-    # Always pin brand font (coerces Inter → Roboto even if agent set Inter).
-    table_defaults["font_family"] = brand_family
+    if brand_family and not table_defaults.get("font_family"):
+        table_defaults["font_family"] = brand_family
     if brand_weight is not None and "font_weight" not in table_defaults:
         table_defaults["font_weight"] = brand_weight
-
     if body_size is not None and "font_size" not in table_defaults:
-        # Tables read slightly smaller than body; clamp softly.
         try:
             table_defaults["font_size"] = min(float(body_size), 12.0)
         except (TypeError, ValueError):
@@ -325,7 +299,7 @@ def apply_text_defaults(
     if not table_defaults.get("section_background"):
         table_defaults["section_background"] = "LIGHT2"
     # Soft mint header (goal look). Avoid ACCENT1@low-alpha — reads as beige
-    # when ACCENT1 is a dark brand green (deployed regression).
+    # when ACCENT1 is a dark brand green.
     user_header_bg = "header_background" in (out.get("table_defaults") or {})
     user_header_alpha = "header_background_alpha" in (out.get("table_defaults") or {})
     if not user_header_bg:
@@ -336,11 +310,10 @@ def apply_text_defaults(
         and isinstance(table_defaults.get("header_background"), str)
         and str(table_defaults["header_background"]).startswith("#")
     ):
-        # Solid hex fills — drop stale alpha so we don't tint mint into beige.
         table_defaults.pop("header_background_alpha", None)
     out["table_defaults"] = table_defaults
 
-    # --- chart_defaults: font + accent series from theme when omitted ---
+    # --- chart_defaults: font + accent series when omitted ---
     chart_defaults = dict(out.get("chart_defaults") or {})
     if brand_family and not chart_defaults.get("font_family"):
         chart_defaults["font_family"] = brand_family
@@ -360,11 +333,11 @@ def apply_text_defaults(
     if brand_family:
         if brand_weight is not None:
             overlay_style["weightedFontFamily"] = {
-                "fontFamily": brand_family,
+                "fontFamily": str(brand_family),
                 "weight": int(brand_weight),
             }
         else:
-            overlay_style["fontFamily"] = brand_family
+            overlay_style["fontFamily"] = str(brand_family)
         if body_size is not None:
             overlay_style["fontSize"] = {"magnitude": float(body_size), "unit": "PT"}
 
@@ -415,33 +388,8 @@ def apply_text_defaults(
                     merged[1] = base
                 styles["body"] = merged[: len(fields_body)]
 
-        # TITLE placeholders often keep a stale explicit face (Inter). Always pin
-        # Roboto Light — overwrite Inter / bare Roboto if still present.
-        if brand_family and (slide.get("fields") or {}).get("title"):
-            title_existing = styles.get("title")
-            title_merged = (
-                dict(title_existing) if isinstance(title_existing, dict) else {}
-            )
-            existing_face = (
-                (title_merged.get("weightedFontFamily") or {}).get("fontFamily")
-                or title_merged.get("fontFamily")
-            )
-            needs_pin = (
-                not existing_face
-                or _canonical_brand_font(str(existing_face)) != str(existing_face)
-                or str(existing_face) != brand_family
-            )
-            if needs_pin:
-                # Named "Roboto Light" face — weight 300 keeps the Light cut.
-                tw = int(brand_weight) if brand_weight is not None else 300
-                if tw > 300:
-                    tw = 300
-                title_merged["fontFamily"] = brand_family
-                title_merged["weightedFontFamily"] = {
-                    "fontFamily": brand_family,
-                    "weight": tw,
-                }
-                styles["title"] = title_merged
+        # Do NOT stamp TITLE fonts — placeholders inherit the template theme.
+        # Agent can set styles.title / text_defaults when a one-off override is needed.
 
         if styles:
             slide["styles"] = styles
