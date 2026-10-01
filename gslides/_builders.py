@@ -605,9 +605,18 @@ def _normalize_table_text_style(
 
     Friendly keys: font_family, font_weight (100–900), font_size, color (#RRGGBB),
     bold, italic. API keys (fontFamily, weightedFontFamily, fontSize, …) pass through.
+    Stale faces like Inter are coerced to Roboto.
     """
     out: Dict[str, Any] = {}
     src = dict(style or {})
+
+    def _coerce_face(name: Optional[str]) -> Optional[str]:
+        if not name:
+            return None
+        low = str(name).strip().lower()
+        if low.startswith("inter"):
+            return "Roboto"
+        return str(name).strip()
 
     # Friendly → API
     if "font_family" in src and "fontFamily" not in src and "weightedFontFamily" not in src:
@@ -634,20 +643,31 @@ def _normalize_table_text_style(
             continue
         out[key] = value
 
+    # Prefer explicit brand font_family arg; coerce Inter from any source.
     family = (
-        (out.get("weightedFontFamily") or {}).get("fontFamily")
-        or out.get("fontFamily")
-        or font_family
+        _coerce_face(font_family)
+        or _coerce_face(
+            (out.get("weightedFontFamily") or {}).get("fontFamily")
+            or out.get("fontFamily")
+        )
+        or "Roboto"
     )
+
     weight = src.get("font_weight", font_weight)
-    if family and weight is not None and "weightedFontFamily" not in out:
-        out["weightedFontFamily"] = {
-            "fontFamily": str(family),
-            "weight": int(weight),
-        }
-        out.pop("fontFamily", None)
-    elif family and "fontFamily" not in out and "weightedFontFamily" not in out:
-        out["fontFamily"] = str(family)
+    if weight is None:
+        weight = 300
+    try:
+        weight = int(weight)
+    except (TypeError, ValueError):
+        weight = 300
+
+    # Set BOTH fontFamily and weightedFontFamily (matching) — Slides UI + API
+    # are most reliable when they agree.
+    out["fontFamily"] = str(family)
+    out["weightedFontFamily"] = {
+        "fontFamily": str(family),
+        "weight": weight,
+    }
 
     if font_size_pt is not None and "fontSize" not in out:
         out["fontSize"] = {"magnitude": float(font_size_pt), "unit": "PT"}
@@ -869,6 +889,8 @@ def build_table_requests(
         pos["h"] = min(auto_h, DEFAULT_PAGE_H_PT - pos["y"] - 20.0)
 
     font_family = table_spec.get("font_family") or table_spec.get("fontFamily") or "Roboto"
+    if str(font_family).strip().lower().startswith("inter"):
+        font_family = "Roboto"
     font_weight = table_spec.get("font_weight")
     if font_weight is not None:
         try:
@@ -884,10 +906,9 @@ def build_table_requests(
         table_spec.get("header_style") or {"bold": True},
         font_family=font_family,
         font_weight=(
-            None
+            int((table_spec.get("header_style") or {}).get("font_weight"))
             if (table_spec.get("header_style") or {}).get("font_weight") is not None
-            or (table_spec.get("header_style") or {}).get("weightedFontFamily")
-            else (400 if font_weight and font_weight < 400 else font_weight)
+            else 400
         ),
         font_size_pt=font_size,
     )
@@ -1193,8 +1214,10 @@ def build_table_requests(
                         font_size_pt=font_size,
                     )
                 )
-            if "weightedFontFamily" in cell_style:
-                cell_style.pop("fontFamily", None)
+            # Keep fontFamily + weightedFontFamily in sync (API requires match).
+            wff = cell_style.get("weightedFontFamily") or {}
+            if wff.get("fontFamily"):
+                cell_style["fontFamily"] = wff["fontFamily"]
             if link:
                 cell_style["link"] = {"url": link}
             if cell_style:
@@ -1741,19 +1764,19 @@ def build_slide_with_placeholders(
 
     if "table" in slide_spec and slide_spec["table"]:
         table_spec = dict(slide_spec["table"])
-        # Fit the table into the layout's BODY area when the agent omitted
-        # position — matches the green content frame on Title + Table.
-        if not table_spec.get("position") and discovered_layout_id:
+        # Fit the table into the layout's BODY area. Agent-supplied `position`
+        # often parks the table inside the dark brand bar — always snap to BODY
+        # geometry when available (Title + Table and similar).
+        if discovered_layout_id:
             geom = get_layout_placeholder_geometry(
                 presentation, discovered_layout_id, "BODY", 0
             )
             if geom is not None:
                 size, transform = geom
                 box = geometry_to_position(size, transform)
-                # Title + Table cards have a dark brand bar at the top of the
-                # BODY frame — inset so the table sits in the white content area.
+                # Dark brand bar sits at the top of the BODY frame on Title + Table.
                 side_inset = 14.0
-                top_inset = 48.0
+                top_inset = 72.0
                 if box["w"] > 2 * side_inset and box["h"] > top_inset + 20:
                     table_spec["position"] = {
                         "x": box["x"] + side_inset,

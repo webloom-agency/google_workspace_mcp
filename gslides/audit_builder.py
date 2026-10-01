@@ -1627,6 +1627,12 @@ async def create_audit_presentation(
         logger.info(
             f"[create_audit_presentation] Theme font detected: {pre.theme_font!r}"
         )
+    td = deck.get("table_defaults") or {}
+    logger.info(
+        "[create_audit_presentation] Effective table typography: "
+        f"font_family={td.get('font_family')!r} font_weight={td.get('font_weight')!r} "
+        f"header_background={td.get('header_background')!r}"
+    )
     if pre.inferred_chart_positions:
         logger.info(
             f"[create_audit_presentation] Inferred chart position for "

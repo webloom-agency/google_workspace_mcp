@@ -37,6 +37,19 @@ _CHART_POSITION_BY_LAYOUT = {
     "title + chart": {"x": 60.0, "y": 110.0, "w": 600.0, "h": 270.0},
 }
 
+# Stale faces agents / masters still send. Theme UI is Roboto — never ship Inter.
+_STALE_FONT_FAMILIES = frozenset({"inter", "inter tight", "inter variable"})
+
+
+def _canonical_brand_font(family: Optional[str]) -> str:
+    """Normalize a font face for tables/titles. Inter → Roboto."""
+    if not family or not str(family).strip():
+        return "Roboto"
+    name = str(family).strip()
+    if name.lower() in _STALE_FONT_FAMILIES or name.lower().startswith("inter"):
+        return "Roboto"
+    return name
+
 
 @dataclass
 class PreprocessResult:
@@ -251,7 +264,7 @@ def apply_text_defaults(
     explicit_text = isinstance(user_text_defaults, dict) and bool(user_text_defaults)
     text_defaults = dict(user_text_defaults or {})
 
-    brand_family = (
+    raw_brand = (
         text_defaults.get("font_family")
         or (out.get("table_defaults") or {}).get("font_family")
         or (out.get("chart_defaults") or {}).get("font_family")
@@ -260,9 +273,15 @@ def apply_text_defaults(
         # (Roboto). Tables can't inherit, so default them to Roboto below.
     )
     # Tables / TEXT_BOX overlays cannot inherit the Slides theme font. Default
-    # to Roboto (webloom brand). Callers override via table_defaults / text_defaults.
-    if not brand_family:
-        brand_family = "Roboto"
+    # to Roboto (webloom brand). Coerce Inter even when the agent still sends it.
+    brand_family = _canonical_brand_font(raw_brand if isinstance(raw_brand, str) else None)
+    if raw_brand and str(raw_brand).strip() and brand_family != str(raw_brand).strip():
+        logger.info(
+            "[create_audit_presentation] Coercing font_family %r → %r "
+            "(stale face; Theme UI / brand is Roboto)",
+            raw_brand,
+            brand_family,
+        )
 
     brand_weight = (
         text_defaults.get("font_weight")
@@ -278,10 +297,11 @@ def apply_text_defaults(
 
     # --- table_defaults: always seed from theme when caller omitted keys ---
     table_defaults = dict(out.get("table_defaults") or {})
-    if brand_family and not table_defaults.get("font_family"):
-        table_defaults["font_family"] = brand_family
+    # Always pin brand font (coerces Inter → Roboto even if agent set Inter).
+    table_defaults["font_family"] = brand_family
     if brand_weight is not None and "font_weight" not in table_defaults:
         table_defaults["font_weight"] = brand_weight
+
     if body_size is not None and "font_size" not in table_defaults:
         # Tables read slightly smaller than body; clamp softly.
         try:
@@ -391,20 +411,28 @@ def apply_text_defaults(
                 styles["body"] = merged[: len(fields_body)]
 
         # TITLE placeholders often keep a stale explicit face (Inter) even when
-        # Theme UI shows Roboto. Pin brand_family (Roboto) — never theme.font_family
-        # from extract_theme (that was the Inter title regression).
+        # Theme UI shows Roboto. Always pin brand_family — overwrite Inter if the
+        # agent/styles still carry it.
         if brand_family and (slide.get("fields") or {}).get("title"):
             title_existing = styles.get("title")
             title_merged = (
                 dict(title_existing) if isinstance(title_existing, dict) else {}
             )
-            if not title_merged.get("fontFamily") and not title_merged.get(
-                "weightedFontFamily"
-            ):
-                # Titles use Regular (400+); Light (300) reads as Inter-ish thin.
+            existing_face = (
+                (title_merged.get("weightedFontFamily") or {}).get("fontFamily")
+                or title_merged.get("fontFamily")
+            )
+            needs_pin = (
+                not existing_face
+                or _canonical_brand_font(str(existing_face)) != str(existing_face)
+                or str(existing_face) != brand_family
+            )
+            if needs_pin:
+                # Titles use Regular (400+); Light (300) reads thin.
                 tw = int(brand_weight) if brand_weight is not None else 400
                 if tw < 400:
                     tw = 400
+                title_merged["fontFamily"] = brand_family
                 title_merged["weightedFontFamily"] = {
                     "fontFamily": brand_family,
                     "weight": tw,
