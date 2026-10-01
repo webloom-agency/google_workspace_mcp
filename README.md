@@ -1055,7 +1055,7 @@ Height used to default to nearly the full slide (stretched rows). Defaults are n
 | Style field | Notes |
 |---|---|
 | `font_family` / `font_weight` | Snapshotted from template BODY when omitted. `font_weight: 300` → Light. |
-| `border_color` / `text_color` / `zebra_color` | Theme tokens (`DARK2`, `DARK1`, `LIGHT2`) or `#RRGGBB`. |
+| `border_color` / `text_color` / `zebra_color` | Theme tokens (`LIGHT2`, `DARK1`, …) or `#RRGGBB`. Borders are always opaque (Slides rejects border alpha). |
 | `header_underline` | Default `true` — thicker bottom border under the header row. |
 | `column_roles` | `label` / `metric` / `narrative` — widths + alignment. |
 | Section rows | `{"section": "Engagement"}` in `rows`. |

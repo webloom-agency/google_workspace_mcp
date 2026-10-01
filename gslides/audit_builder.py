@@ -1438,7 +1438,7 @@ async def create_audit_presentation(
           "header_underline": true,
           "column_roles": ["label", "metric", "narrative"]
         },
-        # border_color / text_color default to theme tokens DARK2 / DARK1.
+        # border_color / text_color default to theme tokens LIGHT2 / DARK1.
         # Omit text_defaults so placeholders inherit the master live.
         # Only set text_defaults when you intentionally override the theme.
         "auto_split": true,

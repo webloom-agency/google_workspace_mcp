@@ -275,7 +275,7 @@ def apply_text_defaults(
             pass
     # Theme-linked colors (Slides themeColor tokens — track theme edits on rebuild).
     if not table_defaults.get("border_color"):
-        table_defaults["border_color"] = "DARK2"
+        table_defaults["border_color"] = "LIGHT2"
     if not table_defaults.get("zebra_color") and table_defaults.get("zebra"):
         table_defaults["zebra_color"] = "LIGHT2"
     if not table_defaults.get("text_color"):

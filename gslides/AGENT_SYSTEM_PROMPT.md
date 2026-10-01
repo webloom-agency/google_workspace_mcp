@@ -48,7 +48,7 @@ Optional overrides (only when you must deviate from the theme):
 ```json
 "text_defaults": { "font_family": "Roboto", "font_weight": 300, "body_font_size": 12 },
 "table_defaults": {
-  "border_color": "DARK2",
+  "border_color": "LIGHT2",
   "text_color": "DARK1",
   "zebra": true,
   "zebra_color": "LIGHT2"

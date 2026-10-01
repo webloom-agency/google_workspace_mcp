@@ -503,7 +503,7 @@ def build_create_slide(
 _TABLE_DEFAULT_ROW_H_PT = 28.0
 _TABLE_DEFAULT_FONT_SIZE_PT = 11.0
 _TABLE_DEFAULT_BORDER_PT = 0.75
-_TABLE_DEFAULT_BORDER_COLOR = "DARK2"  # themeColor — tracks template theme
+_TABLE_DEFAULT_BORDER_COLOR = "LIGHT2"  # themeColor — soft grid; borders can't use alpha
 _TABLE_MIN_COL_W_PT = 32.0  # Slides API floor for columnWidth
 _TABLE_DEFAULT_PAD_X_PT = 40.0
 _TABLE_DEFAULT_PAD_Y_PT = 90.0
@@ -953,9 +953,10 @@ def build_table_requests(
         )
 
     try:
-        border_fill = _slides_solid_fill(str(border_color), alpha=0.45)
+        # Table borders reject alpha other than 0 or 1 — always solid.
+        border_fill = _slides_solid_fill(str(border_color))
     except ValueError:
-        border_fill = _slides_solid_fill(_TABLE_DEFAULT_BORDER_COLOR, alpha=0.45)
+        border_fill = _slides_solid_fill(_TABLE_DEFAULT_BORDER_COLOR)
     requests.append(
         {
             "updateTableBorderProperties": {
@@ -974,7 +975,7 @@ def build_table_requests(
     # Editorial header rule: thicker bottom border under the header row.
     if headers and header_underline:
         try:
-            underline_fill = _slides_solid_fill(str(header_underline_color), alpha=0.7)
+            underline_fill = _slides_solid_fill(str(header_underline_color))
         except ValueError:
             underline_fill = border_fill
         requests.append(
