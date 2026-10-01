@@ -167,6 +167,13 @@ def extract_theme(presentation: Dict[str, Any]) -> ThemeInfo:
             _scan(layout.get("pageElements") or [])
             if theme.font_family:
                 break
+    # Masters/layouts often omit explicit fontFamily (inherited from the
+    # Slides theme UI). Fall back to any styled text on existing slides.
+    if not theme.font_family:
+        for slide in presentation.get("slides") or []:
+            _scan(slide.get("pageElements") or [])
+            if theme.font_family:
+                break
     return theme
 
 
@@ -250,6 +257,15 @@ def apply_text_defaults(
         or (out.get("chart_defaults") or {}).get("font_family")
         or theme.font_family
     )
+    # Masters/layouts often omit explicit fontFamily (theme-UI-only edits).
+    # Fall back to Roboto so tables/titles don't silently render as Inter/Arial.
+    if not brand_family:
+        brand_family = "Roboto"
+        logger.info(
+            "[create_audit_presentation] No theme fontFamily found on master/"
+            "layouts/slides — falling back to Roboto for tables/overlays/titles."
+        )
+
     brand_weight = (
         text_defaults.get("font_weight")
         if text_defaults.get("font_weight") is not None
@@ -284,6 +300,11 @@ def apply_text_defaults(
         table_defaults["header_underline_color"] = "DARK1"
     if not table_defaults.get("section_background"):
         table_defaults["section_background"] = "LIGHT2"
+    # Soft brand tint on header row (matches clean audit tables / goal mock).
+    if "header_background" not in table_defaults:
+        table_defaults["header_background"] = "ACCENT1"
+    if "header_background_alpha" not in table_defaults:
+        table_defaults["header_background_alpha"] = 0.14
     out["table_defaults"] = table_defaults
 
     # --- chart_defaults: font + accent series from theme when omitted ---
@@ -360,6 +381,24 @@ def apply_text_defaults(
                     base.update(merged[1])
                     merged[1] = base
                 styles["body"] = merged[: len(fields_body)]
+
+        # Pin TITLE fontFamily from theme when known. TITLE placeholders often
+        # keep an older face (e.g. Inter) after BODY was switched to Roboto in
+        # the theme editor — without this, titles and tables disagree.
+        if brand_family and (slide.get("fields") or {}).get("title"):
+            title_existing = styles.get("title")
+            title_merged = dict(title_existing) if isinstance(title_existing, dict) else {}
+            if not title_merged.get("fontFamily") and not title_merged.get(
+                "weightedFontFamily"
+            ):
+                if brand_weight is not None:
+                    title_merged["weightedFontFamily"] = {
+                        "fontFamily": brand_family,
+                        "weight": int(brand_weight) if int(brand_weight) >= 400 else 400,
+                    }
+                else:
+                    title_merged["fontFamily"] = brand_family
+                styles["title"] = title_merged
 
         if styles:
             slide["styles"] = styles

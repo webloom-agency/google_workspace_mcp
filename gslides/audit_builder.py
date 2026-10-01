@@ -474,6 +474,7 @@ _TABLE_DEFAULT_KEYS = (
     "border_color",
     "border_weight",
     "header_background",
+    "header_background_alpha",
     "header_underline",
     "header_underline_color",
     "header_style",

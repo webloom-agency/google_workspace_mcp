@@ -260,6 +260,36 @@ def resolve_layout_reference(
     )
 
 
+def _dimension_to_pt(dim: Optional[Dict[str, Any]]) -> float:
+    """Convert a Slides Dimension ({magnitude, unit}) to points."""
+    if not dim:
+        return 0.0
+    mag = float(dim.get("magnitude") or 0)
+    unit = (dim.get("unit") or "EMU").upper()
+    if unit == "PT":
+        return mag
+    # EMU (English Metric Unit): 12700 EMU = 1 PT
+    return mag / 12700.0
+
+
+def geometry_to_position(
+    size: Dict[str, Any], transform: Dict[str, Any]
+) -> Dict[str, float]:
+    """Convert layout placeholder size+transform into {x,y,w,h} in PT."""
+    scale_x = float(transform.get("scaleX") or 1.0)
+    scale_y = float(transform.get("scaleY") or 1.0)
+    w = _dimension_to_pt(size.get("width")) * abs(scale_x)
+    h = _dimension_to_pt(size.get("height")) * abs(scale_y)
+    # translate may be EMU or PT depending on transform.unit
+    t_unit = (transform.get("unit") or "EMU").upper()
+    tx = float(transform.get("translateX") or 0)
+    ty = float(transform.get("translateY") or 0)
+    if t_unit != "PT":
+        tx /= 12700.0
+        ty /= 12700.0
+    return {"x": tx, "y": ty, "w": w, "h": h}
+
+
 def _pt(value: float) -> Dict[str, Any]:
     return {"magnitude": float(value), "unit": "PT"}
 
@@ -726,8 +756,8 @@ _COLUMN_ROLE_WEIGHTS = {
 }
 _COLUMN_ROLE_ALIGN = {
     "label": "START",
-    "metric": "END",
-    "value": "END",
+    "metric": "CENTER",
+    "value": "CENTER",
     "narrative": "START",
     "lecture": "START",
     "text": "START",
@@ -887,6 +917,7 @@ def build_table_requests(
     border_color = table_spec.get("border_color") or _TABLE_DEFAULT_BORDER_COLOR
     border_w = float(table_spec.get("border_weight") or _TABLE_DEFAULT_BORDER_PT)
     header_bg = table_spec.get("header_background")
+    header_bg_alpha = table_spec.get("header_background_alpha")
     header_underline = table_spec.get("header_underline", True)
     header_underline_color = table_spec.get("header_underline_color") or "DARK1"
     zebra = table_spec.get("zebra") or table_spec.get("zebra_rows")
@@ -1009,6 +1040,15 @@ def build_table_requests(
     )
     if headers and header_bg:
         try:
+            alpha = None
+            if header_bg_alpha is not None:
+                alpha = float(header_bg_alpha)
+            fill = _slides_solid_fill(str(header_bg), alpha=alpha)
+            fields = (
+                "tableCellBackgroundFill.solidFill"
+                if alpha is not None
+                else "tableCellBackgroundFill.solidFill.color"
+            )
             requests.append(
                 {
                     "updateTableCellProperties": {
@@ -1019,13 +1059,13 @@ def build_table_requests(
                             "columnSpan": n_cols,
                         },
                         "tableCellProperties": {
-                            "tableCellBackgroundFill": _slides_solid_fill(str(header_bg)),
+                            "tableCellBackgroundFill": fill,
                         },
-                        "fields": "tableCellBackgroundFill.solidFill.color",
+                        "fields": fields,
                     }
                 }
             )
-        except ValueError:
+        except (ValueError, TypeError):
             pass
 
     # Zebra striping on body rows (skip section rows).
@@ -1541,6 +1581,27 @@ def build_slide_with_placeholders(
         if allocated is None:
             skipped_fields.append(f"body[{i}] (BODY)")
 
+    # Title + Table (and similar): layout still exposes a BODY placeholder.
+    # If the deck only supplies a `table` (no body text), that BODY stays as
+    # the grey "Click to add text" prompt behind the table. Bind + delete it.
+    has_table = bool(slide_spec.get("table"))
+    if has_table and not body_texts:
+        n_body = len(layout_placeholders_by_type.get("BODY") or [])
+        # If we couldn't discover placeholders, still try BODY occurrence 0.
+        to_clear = n_body if n_body else 1
+        for i in range(to_clear):
+            allocated = _allocate_placeholder("BODY", i, f"body_unused[{i}]")
+            if allocated is None and n_body == 0 and i == 0:
+                # Predefined / unknown layout: attempt a type-only mapping.
+                ph_id = gen_id("ph")
+                placeholder_ids[f"body_unused[{i}]"] = ph_id
+                placeholder_mappings.append(
+                    {
+                        "layoutPlaceholder": {"type": "BODY"},
+                        "objectId": ph_id,
+                    }
+                )
+
     image_placeholder_specs = slide_spec.get("image_placeholders") or []
     image_fill: List[Tuple[str, Dict[str, Any]]] = []
     for i, raw in enumerate(image_placeholder_specs):
@@ -1574,6 +1635,12 @@ def build_slide_with_placeholders(
         )
     ]
     content_requests: List[Dict[str, Any]] = []
+
+    # Remove unused BODY placeholders so "Click to add text" never shows
+    # behind tables / charts that occupy the body area.
+    for key, ph_id in list(placeholder_ids.items()):
+        if key.startswith("body_unused"):
+            content_requests.append({"deleteObject": {"objectId": ph_id}})
 
     # Fill simple single-instance text placeholders.
     for field_name in simple_text_fields:
@@ -1653,7 +1720,25 @@ def build_slide_with_placeholders(
         content_requests.extend(title_requests)
 
     if "table" in slide_spec and slide_spec["table"]:
-        content_requests.extend(build_table_requests(slide_id, slide_spec["table"]))
+        table_spec = dict(slide_spec["table"])
+        # Fit the table into the layout's BODY area when the agent omitted
+        # position — matches the green content frame on Title + Table.
+        if not table_spec.get("position") and discovered_layout_id:
+            geom = get_layout_placeholder_geometry(
+                presentation, discovered_layout_id, "BODY", 0
+            )
+            if geom is not None:
+                size, transform = geom
+                box = geometry_to_position(size, transform)
+                inset = 8.0
+                if box["w"] > 2 * inset and box["h"] > inset:
+                    table_spec["position"] = {
+                        "x": box["x"] + inset,
+                        "y": box["y"] + inset,
+                        "w": box["w"] - 2 * inset,
+                        # Omit h → content-fit row heights (no stretched rows).
+                    }
+        content_requests.extend(build_table_requests(slide_id, table_spec))
 
     if "image" in slide_spec and slide_spec["image"]:
         content_requests.extend(build_image_requests(slide_id, slide_spec["image"]))
