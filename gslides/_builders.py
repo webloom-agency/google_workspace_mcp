@@ -868,13 +868,15 @@ def build_table_requests(
     if not (table_spec.get("position") or {}).get("h"):
         pos["h"] = min(auto_h, DEFAULT_PAGE_H_PT - pos["y"] - 20.0)
 
-    font_family = table_spec.get("font_family") or table_spec.get("fontFamily")
+    font_family = table_spec.get("font_family") or table_spec.get("fontFamily") or "Roboto"
     font_weight = table_spec.get("font_weight")
     if font_weight is not None:
         try:
             font_weight = int(font_weight)
         except (TypeError, ValueError):
-            font_weight = None
+            font_weight = 300
+    else:
+        font_weight = 300
     font_size = table_spec.get("font_size")
     font_size = float(font_size) if font_size is not None else _TABLE_DEFAULT_FONT_SIZE_PT
 
@@ -944,19 +946,36 @@ def build_table_requests(
             col_align.append("START")
 
     table_id = gen_id("tbl")
+    # IMPORTANT: The Slides API *ignores* size/transform on createTable and
+    # centers the table on the slide. We must follow up with
+    # updatePageElementTransform (translate only — tables cannot be scaled)
+    # plus column widths for horizontal size.
     requests: List[Dict[str, Any]] = [
         {
             "createTable": {
                 "objectId": table_id,
                 "elementProperties": {
                     "pageObjectId": slide_id,
-                    "size": _size(pos["w"], pos["h"]),
-                    "transform": _transform(pos["x"], pos["y"]),
                 },
                 "rows": n_rows,
                 "columns": n_cols,
             }
-        }
+        },
+        {
+            "updatePageElementTransform": {
+                "objectId": table_id,
+                "applyMode": "ABSOLUTE",
+                "transform": {
+                    "scaleX": 1,
+                    "scaleY": 1,
+                    "shearX": 0,
+                    "shearY": 0,
+                    "translateX": float(pos["x"]),
+                    "translateY": float(pos["y"]),
+                    "unit": "PT",
+                },
+            }
+        },
     ]
 
     requests.append(
@@ -1041,7 +1060,8 @@ def build_table_requests(
     if headers and header_bg:
         try:
             alpha = None
-            if header_bg_alpha is not None:
+            # Solid hex fills must stay opaque — ACCENT1@0.14 was reading as beige.
+            if header_bg_alpha is not None and not str(header_bg).startswith("#"):
                 alpha = float(header_bg_alpha)
             fill = _slides_solid_fill(str(header_bg), alpha=alpha)
             fields = (
@@ -1730,13 +1750,15 @@ def build_slide_with_placeholders(
             if geom is not None:
                 size, transform = geom
                 box = geometry_to_position(size, transform)
-                inset = 8.0
-                if box["w"] > 2 * inset and box["h"] > inset:
+                # Title + Table cards have a dark brand bar at the top of the
+                # BODY frame — inset so the table sits in the white content area.
+                side_inset = 14.0
+                top_inset = 48.0
+                if box["w"] > 2 * side_inset and box["h"] > top_inset + 20:
                     table_spec["position"] = {
-                        "x": box["x"] + inset,
-                        "y": box["y"] + inset,
-                        "w": box["w"] - 2 * inset,
-                        # Omit h → content-fit row heights (no stretched rows).
+                        "x": box["x"] + side_inset,
+                        "y": box["y"] + top_inset,
+                        "w": box["w"] - 2 * side_inset,
                     }
         content_requests.extend(build_table_requests(slide_id, table_spec))
 

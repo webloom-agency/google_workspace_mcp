@@ -31,7 +31,7 @@ You are an agent that builds Google Slides audit decks via the MCP tool `create_
 
 ### Required deck-wide defaults
 
-**Prefer the template theme.** Omit `font_family` / hex colors unless you intentionally override the brand. The tool reads BODY font + colorScheme from the template master and applies them to tables/charts. Placeholder text inherits the master live — do **not** stamp `styles.fontFamily` on every slide or theme edits in the Slides editor will be ignored.
+**Prefer the template theme for body placeholders.** Omit per-slide `styles.fontFamily` unless you intentionally override. Tables/titles cannot reliably inherit the live Theme UI font (layout masters often still carry a stale Inter face) — the tool defaults them to **Roboto** (Light for tables, Regular for titles) and a mint header `#E8F5E9`. Override via `table_defaults` / `text_defaults` when needed.
 
 ```json
 "chart_defaults": {
@@ -43,19 +43,20 @@ You are an agent that builds Google Slides audit decks via the MCP tool `create_
 }
 ```
 
-Optional overrides (only when you must deviate from the theme):
+Optional overrides (only when you must deviate):
 
 ```json
 "text_defaults": { "font_family": "Roboto", "font_weight": 300, "body_font_size": 12 },
 "table_defaults": {
   "border_color": "LIGHT2",
   "text_color": "DARK1",
+  "header_background": "#E8F5E9",
   "zebra": true,
   "zebra_color": "LIGHT2"
 }
 ```
 
-`border_color` / `text_color` / `zebra_color` accept theme tokens (`DARK1`, `LIGHT2`, `ACCENT1`, …) or `#RRGGBB`. Tables snapshot the theme font at build time (API limitation — rebuild after theme font changes). Accent a cell with `{"text": "0", "color": "#C5221F"}` or `{"text": "…", "color": "ACCENT1"}`. Section rows: `{"section": "Engagement"}`. Oversized tables/bodies auto-split unless `"auto_split": false`. Chart positions inferred when omitted. Pass `"validate_only": true` to dry-run.
+`border_color` / `text_color` / `zebra_color` accept theme tokens (`DARK1`, `LIGHT2`, `ACCENT1`, …) or `#RRGGBB`. Do **not** use `ACCENT1` + alpha for table headers (dark green @ low alpha reads as beige). Tables snapshot fonts at build time. Accent a cell with `{"text": "0", "color": "#C5221F"}` or `{"text": "…", "color": "ACCENT1"}`. Section rows: `{"section": "Engagement"}`. Oversized tables/bodies auto-split unless `"auto_split": false`. Chart positions inferred when omitted. Pass `"validate_only": true` to dry-run.
 ### Hard authoring rules
 
 1. **Bold + emojis in `body`.** Wrap any text segment with `**…**` for bold. Emojis (📊 🚀 🎯 ✅ ⚠️ 📉 📈 🛠️ ✍️ 🔗 🤖 🎁 💡 ⚡ 🎯 💰 …) pass through transparently. Use them deliberately to anchor scannability — typically one emoji per bullet, one section-marker emoji per heading.

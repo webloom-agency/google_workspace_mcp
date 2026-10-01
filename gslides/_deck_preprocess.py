@@ -255,26 +255,25 @@ def apply_text_defaults(
         text_defaults.get("font_family")
         or (out.get("table_defaults") or {}).get("font_family")
         or (out.get("chart_defaults") or {}).get("font_family")
-        or theme.font_family
+        # Do NOT use theme.font_family from master textStyles — those are often
+        # stale explicit faces (e.g. Inter) that override the live Theme UI font
+        # (Roboto). Tables can't inherit, so default them to Roboto below.
     )
-    # Masters/layouts often omit explicit fontFamily (theme-UI-only edits).
-    # Fall back to Roboto so tables/titles don't silently render as Inter/Arial.
+    # Tables / TEXT_BOX overlays cannot inherit the Slides theme font. Default
+    # to Roboto (webloom brand). Callers override via table_defaults / text_defaults.
     if not brand_family:
         brand_family = "Roboto"
-        logger.info(
-            "[create_audit_presentation] No theme fontFamily found on master/"
-            "layouts/slides — falling back to Roboto for tables/overlays/titles."
-        )
 
     brand_weight = (
         text_defaults.get("font_weight")
         if text_defaults.get("font_weight") is not None
-        else theme.font_weight
+        else 300  # Roboto Light — matches audit decks; ignore stale master weights
     )
     body_size = (
         text_defaults.get("body_font_size")
         or text_defaults.get("font_size")
         or theme.body_font_size
+        or 11
     )
 
     # --- table_defaults: always seed from theme when caller omitted keys ---
@@ -300,11 +299,20 @@ def apply_text_defaults(
         table_defaults["header_underline_color"] = "DARK1"
     if not table_defaults.get("section_background"):
         table_defaults["section_background"] = "LIGHT2"
-    # Soft brand tint on header row (matches clean audit tables / goal mock).
-    if "header_background" not in table_defaults:
-        table_defaults["header_background"] = "ACCENT1"
-    if "header_background_alpha" not in table_defaults:
-        table_defaults["header_background_alpha"] = 0.14
+    # Soft mint header (goal look). Avoid ACCENT1@low-alpha — reads as beige
+    # when ACCENT1 is a dark brand green (deployed regression).
+    user_header_bg = "header_background" in (out.get("table_defaults") or {})
+    user_header_alpha = "header_background_alpha" in (out.get("table_defaults") or {})
+    if not user_header_bg:
+        table_defaults["header_background"] = "#E8F5E9"
+        table_defaults.pop("header_background_alpha", None)
+    elif (
+        not user_header_alpha
+        and isinstance(table_defaults.get("header_background"), str)
+        and str(table_defaults["header_background"]).startswith("#")
+    ):
+        # Solid hex fills — drop stale alpha so we don't tint mint into beige.
+        table_defaults.pop("header_background_alpha", None)
     out["table_defaults"] = table_defaults
 
     # --- chart_defaults: font + accent series from theme when omitted ---
@@ -382,22 +390,25 @@ def apply_text_defaults(
                     merged[1] = base
                 styles["body"] = merged[: len(fields_body)]
 
-        # Pin TITLE fontFamily from theme when known. TITLE placeholders often
-        # keep an older face (e.g. Inter) after BODY was switched to Roboto in
-        # the theme editor — without this, titles and tables disagree.
+        # TITLE placeholders often keep a stale explicit face (Inter) even when
+        # Theme UI shows Roboto. Pin brand_family (Roboto) — never theme.font_family
+        # from extract_theme (that was the Inter title regression).
         if brand_family and (slide.get("fields") or {}).get("title"):
             title_existing = styles.get("title")
-            title_merged = dict(title_existing) if isinstance(title_existing, dict) else {}
+            title_merged = (
+                dict(title_existing) if isinstance(title_existing, dict) else {}
+            )
             if not title_merged.get("fontFamily") and not title_merged.get(
                 "weightedFontFamily"
             ):
-                if brand_weight is not None:
-                    title_merged["weightedFontFamily"] = {
-                        "fontFamily": brand_family,
-                        "weight": int(brand_weight) if int(brand_weight) >= 400 else 400,
-                    }
-                else:
-                    title_merged["fontFamily"] = brand_family
+                # Titles use Regular (400+); Light (300) reads as Inter-ish thin.
+                tw = int(brand_weight) if brand_weight is not None else 400
+                if tw < 400:
+                    tw = 400
+                title_merged["weightedFontFamily"] = {
+                    "fontFamily": brand_family,
+                    "weight": tw,
+                }
                 styles["title"] = title_merged
 
         if styles:
