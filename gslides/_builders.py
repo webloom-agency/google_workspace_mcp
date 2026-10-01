@@ -605,7 +605,7 @@ def _normalize_table_text_style(
 
     Friendly keys: font_family, font_weight (100–900), font_size, color (#RRGGBB),
     bold, italic. API keys (fontFamily, weightedFontFamily, fontSize, …) pass through.
-    Stale faces like Inter are coerced to Roboto.
+    Stale faces like Inter are coerced to Roboto Light.
     """
     out: Dict[str, Any] = {}
     src = dict(style or {})
@@ -614,8 +614,8 @@ def _normalize_table_text_style(
         if not name:
             return None
         low = str(name).strip().lower()
-        if low.startswith("inter"):
-            return "Roboto"
+        if low.startswith("inter") or low == "roboto":
+            return "Roboto Light"
         return str(name).strip()
 
     # Friendly → API
@@ -643,14 +643,14 @@ def _normalize_table_text_style(
             continue
         out[key] = value
 
-    # Prefer explicit brand font_family arg; coerce Inter from any source.
+    # Prefer explicit brand font_family arg; coerce Inter / bare Roboto.
     family = (
         _coerce_face(font_family)
         or _coerce_face(
             (out.get("weightedFontFamily") or {}).get("fontFamily")
             or out.get("fontFamily")
         )
-        or "Roboto"
+        or "Roboto Light"
     )
 
     weight = src.get("font_weight", font_weight)
@@ -816,7 +816,7 @@ def build_table_requests(
         "column_widths": [120, 100, 420],
         "column_roles": ["label", "metric", "narrative"],  # widths + alignment
         "column_align": ["START", "END", "START"],         # overrides roles
-        "font_family": "Roboto",
+        "font_family": "Roboto Light",
         "font_weight": 300,
         "font_size": 11,
         "row_height": 28,
@@ -888,9 +888,9 @@ def build_table_requests(
     if not (table_spec.get("position") or {}).get("h"):
         pos["h"] = min(auto_h, DEFAULT_PAGE_H_PT - pos["y"] - 20.0)
 
-    font_family = table_spec.get("font_family") or table_spec.get("fontFamily") or "Roboto"
-    if str(font_family).strip().lower().startswith("inter"):
-        font_family = "Roboto"
+    font_family = table_spec.get("font_family") or table_spec.get("fontFamily") or "Roboto Light"
+    if str(font_family).strip().lower().startswith("inter") or str(font_family).strip().lower() == "roboto":
+        font_family = "Roboto Light"
     font_weight = table_spec.get("font_weight")
     if font_weight is not None:
         try:
@@ -908,7 +908,7 @@ def build_table_requests(
         font_weight=(
             int((table_spec.get("header_style") or {}).get("font_weight"))
             if (table_spec.get("header_style") or {}).get("font_weight") is not None
-            else 400
+            else 300
         ),
         font_size_pt=font_size,
     )
@@ -1774,9 +1774,10 @@ def build_slide_with_placeholders(
             if geom is not None:
                 size, transform = geom
                 box = geometry_to_position(size, transform)
-                # Dark brand bar sits at the top of the BODY frame on Title + Table.
-                side_inset = 14.0
-                top_inset = 72.0
+                # BODY on Title + Table already sits below the dark brand bar.
+                # Tiny pad only — avoid a dead white gap above the table.
+                side_inset = 12.0
+                top_inset = 8.0
                 if box["w"] > 2 * side_inset and box["h"] > top_inset + 20:
                     table_spec["position"] = {
                         "x": box["x"] + side_inset,

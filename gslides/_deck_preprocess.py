@@ -37,17 +37,22 @@ _CHART_POSITION_BY_LAYOUT = {
     "title + chart": {"x": 60.0, "y": 110.0, "w": 600.0, "h": 270.0},
 }
 
-# Stale faces agents / masters still send. Theme UI is Roboto — never ship Inter.
+# Stale faces agents / masters still send. Brand face is Roboto Light.
 _STALE_FONT_FAMILIES = frozenset({"inter", "inter tight", "inter variable"})
+_BRAND_FONT = "Roboto Light"
 
 
 def _canonical_brand_font(family: Optional[str]) -> str:
-    """Normalize a font face for tables/titles. Inter → Roboto."""
+    """Normalize a font face for tables/titles. Inter / bare Roboto → Roboto Light."""
     if not family or not str(family).strip():
-        return "Roboto"
+        return _BRAND_FONT
     name = str(family).strip()
-    if name.lower() in _STALE_FONT_FAMILIES or name.lower().startswith("inter"):
-        return "Roboto"
+    low = name.lower()
+    if low in _STALE_FONT_FAMILIES or low.startswith("inter"):
+        return _BRAND_FONT
+    # Bare "Roboto" (Regular) is not the audit brand — use Light.
+    if low == "roboto":
+        return _BRAND_FONT
     return name
 
 
@@ -270,15 +275,15 @@ def apply_text_defaults(
         or (out.get("chart_defaults") or {}).get("font_family")
         # Do NOT use theme.font_family from master textStyles — those are often
         # stale explicit faces (e.g. Inter) that override the live Theme UI font
-        # (Roboto). Tables can't inherit, so default them to Roboto below.
+        # (Roboto Light). Tables can't inherit, so default them below.
     )
     # Tables / TEXT_BOX overlays cannot inherit the Slides theme font. Default
-    # to Roboto (webloom brand). Coerce Inter even when the agent still sends it.
+    # to Roboto Light (webloom brand). Coerce Inter / bare Roboto from agents.
     brand_family = _canonical_brand_font(raw_brand if isinstance(raw_brand, str) else None)
     if raw_brand and str(raw_brand).strip() and brand_family != str(raw_brand).strip():
         logger.info(
             "[create_audit_presentation] Coercing font_family %r → %r "
-            "(stale face; Theme UI / brand is Roboto)",
+            "(stale face; brand is Roboto Light)",
             raw_brand,
             brand_family,
         )
@@ -410,9 +415,8 @@ def apply_text_defaults(
                     merged[1] = base
                 styles["body"] = merged[: len(fields_body)]
 
-        # TITLE placeholders often keep a stale explicit face (Inter) even when
-        # Theme UI shows Roboto. Always pin brand_family — overwrite Inter if the
-        # agent/styles still carry it.
+        # TITLE placeholders often keep a stale explicit face (Inter). Always pin
+        # Roboto Light — overwrite Inter / bare Roboto if still present.
         if brand_family and (slide.get("fields") or {}).get("title"):
             title_existing = styles.get("title")
             title_merged = (
@@ -428,10 +432,10 @@ def apply_text_defaults(
                 or str(existing_face) != brand_family
             )
             if needs_pin:
-                # Titles use Regular (400+); Light (300) reads thin.
-                tw = int(brand_weight) if brand_weight is not None else 400
-                if tw < 400:
-                    tw = 400
+                # Named "Roboto Light" face — weight 300 keeps the Light cut.
+                tw = int(brand_weight) if brand_weight is not None else 300
+                if tw > 300:
+                    tw = 300
                 title_merged["fontFamily"] = brand_family
                 title_merged["weightedFontFamily"] = {
                     "fontFamily": brand_family,

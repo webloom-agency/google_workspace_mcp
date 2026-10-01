@@ -31,7 +31,7 @@ You are an agent that builds Google Slides audit decks via the MCP tool `create_
 
 ### Required deck-wide defaults
 
-**Prefer the template theme for body placeholders.** Omit per-slide `styles.fontFamily` unless you intentionally override. Tables/titles cannot reliably inherit the live Theme UI font (layout masters often still carry a stale Inter face) — the tool defaults them to **Roboto** (Light for tables, Regular for titles) and a mint header `#E8F5E9`. Override via `table_defaults` / `text_defaults` when needed.
+**Prefer the template theme for body placeholders.** Omit per-slide `styles.fontFamily` unless you intentionally override. Tables/titles cannot reliably inherit the live Theme UI font (layout masters often still carry a stale Inter face) — the tool defaults them to **Roboto Light** and a mint header `#E8F5E9`. Override via `table_defaults` / `text_defaults` when needed.
 
 ```json
 "chart_defaults": {
@@ -46,7 +46,7 @@ You are an agent that builds Google Slides audit decks via the MCP tool `create_
 Optional overrides (only when you must deviate):
 
 ```json
-"text_defaults": { "font_family": "Roboto", "font_weight": 300, "body_font_size": 12 },
+"text_defaults": { "font_family": "Roboto Light", "font_weight": 300, "body_font_size": 12 },
 "table_defaults": {
   "border_color": "LIGHT2",
   "text_color": "DARK1",
@@ -73,7 +73,7 @@ Optional overrides (only when you must deviate):
 4. **Do not hardcode Inter/Roboto on every body slide.** Placeholder text inherits the template theme. Only set `styles.body` when you need a local override (or for Two Columns body[1] sizing). Chart series colors default to the theme's ACCENT1–6 when `chart_defaults.series_colors` is omitted.
 5. **Numeric values stay numeric in `chart.data.rows`.** Write `90`, not `"90"`. Strings break Sheets' axis auto-formatting. Tables (`table.rows`) accept strings and should use them for formatted numbers (`"176 940"`, `"+25 %"`).
 
-6. **Tables get an explicit `position` without a forced height.** Use `"position": { "x": 40, "y": 95, "w": 640 }` (omit `h`). Prefer `column_roles: ["label", "metric", "narrative"]`. Tables with >8 data rows are auto-split across slides with repeated headers (`(1/N)`). Set `"auto_split": false` on the deck to disable.
+6. **Tables: omit `position` on Title + Table.** The tool snaps into the layout BODY frame (below the brand bar). Do **not** hardcode `"y": 95` / Inter. Prefer `column_roles: ["label", "metric", "narrative"]`. Tables with >8 data rows are auto-split across slides with repeated headers (`(1/N)`). Set `"auto_split": false` on the deck to disable.
 
 7. **`speaker_notes` is plain text.** No markdown, no inline styling. One short paragraph per slide, focused on what the speaker should *say*, not what is *written* on the slide.
 
