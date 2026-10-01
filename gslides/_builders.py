@@ -339,20 +339,18 @@ def _maybe_warn_non_public_image_url(url: str) -> None:
     """Best-effort hint when a URL is unlikely to be fetchable by Google's
     image-retrieval servers (which never send cookies or auth headers).
 
-    Slides `replaceImage` succeeds at the API layer even when the fetch
-    fails — the slide then shows a broken-image glyph in the editor. This
-    log line is the only server-side signal short of opening the deck.
+    Public app file routes (`/api/file/…`) are intentionally NOT flagged —
+    those are anonymously fetchable and used for Cover / pair captures.
     """
     if not url:
         return
     u = url.lower()
     risky = (
-        "/api/file/" in u,
-        "auth=" in u,
-        "token=" in u,
         "localhost" in u,
         re.match(r"https?://10\.", u) is not None,
         re.match(r"https?://192\.168\.", u) is not None,
+        # Query-string auth tokens — still cookie-less but often short-lived.
+        "token=" in u and "/api/file/" not in u,
     )
     if any(risky):
         logger.warning(
@@ -1647,6 +1645,8 @@ def build_slide_with_placeholders(
 
     image_placeholder_specs = slide_spec.get("image_placeholders") or []
     image_fill: List[Tuple[str, Dict[str, Any]]] = []
+    n_picture_slots = len(layout_placeholders_by_type.get("PICTURE") or [])
+    layout_label = slide_spec.get("layout") or "(unknown)"
     for i, raw in enumerate(image_placeholder_specs):
         if isinstance(raw, str):
             spec = {"url": raw}
@@ -1658,7 +1658,16 @@ def build_slide_with_placeholders(
             continue
         allocated = _allocate_placeholder("PICTURE", i, f"image[{i}]")
         if allocated is None:
-            skipped_fields.append(f"image[{i}] (PICTURE)")
+            # Do NOT silently drop — logos on Title + Table / Conclusion / etc.
+            # have nowhere to land. Surface a clear error for the MCP response.
+            err = (
+                f"image_placeholders[{i}] rejected: layout '{layout_label}' has "
+                f"{n_picture_slots} PICTURE placeholder(s). Put logos on Cover "
+                f"(or Title + Body with a PICTURE slot), or pass a free-floating "
+                f"`image` block — Title + Table / Two Columns / Conclusion cannot "
+                f"host logos via image_placeholders."
+            )
+            skipped_fields.append(err)
             continue
         image_fill.append((allocated, spec))
 
@@ -1697,6 +1706,36 @@ def build_slide_with_placeholders(
     # Fill BODY placeholder(s). Style may be a single dict (applied to all
     # body shapes) or a list aligned with the body texts.
     body_style = (slide_spec.get("styles") or {}).get("body")
+    # Soft Roboto Light for any body fill that lacks a weight (Two Columns
+    # body[0] often inherits Regular from the master; body[1] TEXT_BOX never
+    # inherits). Matches table_defaults font_weight: 300.
+    _light_fallback = {
+        "fontFamily": "Roboto",
+        "weightedFontFamily": {"fontFamily": "Roboto", "weight": 300},
+    }
+
+    def _with_light_weight(style: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        base = dict(_light_fallback)
+        if isinstance(style, dict):
+            base.update(style)
+        wff = base.get("weightedFontFamily") or {}
+        family = (
+            wff.get("fontFamily")
+            or base.get("fontFamily")
+            or "Roboto"
+        )
+        if str(family).strip().lower() in ("roboto light", "robotolight"):
+            family = "Roboto"
+        weight = wff.get("weight")
+        if weight is None:
+            weight = 300
+        base["fontFamily"] = str(family)
+        base["weightedFontFamily"] = {
+            "fontFamily": str(family),
+            "weight": int(weight),
+        }
+        return base
+
     for i, body_text in enumerate(body_texts):
         ph_id = placeholder_ids.get(f"body[{i}]")
         if not ph_id:
@@ -1705,23 +1744,16 @@ def build_slide_with_placeholders(
             style = body_style[i] if i < len(body_style) else None
         else:
             style = body_style
+        # Two Columns (2+ bodies): always apply Light weight on both columns.
+        multi_body = len(body_texts) > 1 or i in body_overlays
+        if multi_body or i in body_overlays:
+            style = _with_light_weight(style if isinstance(style, dict) else None)
 
         overlay = body_overlays.get(i)
         if overlay is not None:
             # Multi-BODY ghost-bug workaround: TEXT_BOX overlay + delete of the
-            # bound ghost placeholder (see body_unused delete above). Soft-default
-            # Roboto Light when the agent omitted styles — TEXT_BOX can't inherit.
+            # bound ghost placeholder (see body_unused delete above).
             overlay_id, size, transform = overlay
-            if not style or not (
-                style.get("fontFamily") or style.get("weightedFontFamily")
-            ):
-                base = {
-                    "fontFamily": "Roboto",
-                    "weightedFontFamily": {"fontFamily": "Roboto", "weight": 300},
-                }
-                if isinstance(style, dict):
-                    base.update(style)
-                style = base
             content_requests.append(
                 {
                     "createShape": {

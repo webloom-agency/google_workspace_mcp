@@ -1761,6 +1761,7 @@ async def create_audit_presentation(
 
     data_sheet_meta: Optional[Dict[str, Any]] = None
     soft_skips: List[Dict[str, Any]] = []
+    placeholder_skips: List[Dict[str, Any]] = []
     try:
         # 4) Move the deck into the target folder (if any).
         if target_folder_id:
@@ -1954,12 +1955,17 @@ async def create_audit_presentation(
 
             skipped = slide_placeholders.get("__skipped__")
             if skipped:
-                logger.warning(
+                logger.error(
                     f"[create_audit_presentation] Slide #{index + 1} layout="
-                    f"'{slide_spec.get('layout')}': layout has no placeholder for "
-                    f"{skipped}; those fields will not be rendered. Add the missing "
-                    f"placeholder(s) to the layout in your template, or remove the "
-                    f"corresponding field(s) from the slide JSON."
+                    f"'{slide_spec.get('layout')}': {skipped}"
+                )
+                placeholder_skips.append(
+                    {
+                        "slide": index + 1,
+                        "layout": slide_spec.get("layout"),
+                        "kind": "placeholder_mismatch",
+                        "detail": skipped,
+                    }
                 )
 
             chart_spec = slide_spec.get("chart")
@@ -2230,6 +2236,7 @@ async def create_audit_presentation(
             on_slide_done=_phase_b_progress,
             soft_skips=soft_skips,
         )
+        soft_skips = placeholder_skips + soft_skips
 
         # 8) Speaker notes pass: re-fetch to find each slide's speakerNotesObjectId, then insert.
         notes_specs: List[Tuple[int, str]] = [

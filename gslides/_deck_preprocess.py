@@ -335,18 +335,21 @@ def apply_text_defaults(
     body_style = _text_style_from_defaults(text_defaults, role="body") if explicit_text else {}
     title_style = _text_style_from_defaults(text_defaults, role="title") if explicit_text else {}
 
-    # Overlay style for Two-Columns body[1] (TEXT_BOX cannot inherit master).
-    overlay_style: Dict[str, Any] = {}
+    # Overlay / column style: Roboto Light for TEXT_BOX + Two Columns bodies
+    # (placeholders may inherit Regular; overlays never inherit the theme).
+    light_style: Dict[str, Any] = {}
     if brand_family:
         if brand_weight is not None:
-            overlay_style["weightedFontFamily"] = {
+            light_style["weightedFontFamily"] = {
                 "fontFamily": str(brand_family),
                 "weight": int(brand_weight),
             }
+            light_style["fontFamily"] = str(brand_family)
         else:
-            overlay_style["fontFamily"] = str(brand_family)
+            light_style["fontFamily"] = str(brand_family)
         if body_size is not None:
-            overlay_style["fontSize"] = {"magnitude": float(body_size), "unit": "PT"}
+            light_style["fontSize"] = {"magnitude": float(body_size), "unit": "PT"}
+    overlay_style = dict(light_style)
 
     for slide in out.get("slides") or []:
         styles = dict(slide.get("styles") or {})
@@ -378,22 +381,42 @@ def apply_text_defaults(
                     base = dict(body_style)
                     base.update(existing_body)
                     styles["body"] = base
-        elif isinstance(fields_body, list) and len(fields_body) > 1 and overlay_style:
-            # Theme-only path: pin font on body[1] overlay; leave body[0] on master.
+        elif isinstance(fields_body, list) and len(fields_body) > 1 and light_style:
+            # Two Columns: stamp Roboto Light on BOTH columns. body[0] can
+            # inherit a Regular face from the master; body[1] is a TEXT_BOX
+            # that never inherits. Match table_defaults weight 300 on both.
             existing = styles.get("body")
+            n = len(fields_body)
+
+            def _ensure_light(item: Any) -> Dict[str, Any]:
+                if not isinstance(item, dict):
+                    return dict(light_style)
+                if item.get("fontFamily") or item.get("weightedFontFamily"):
+                    # Keep face if set, but force weight 300 when missing.
+                    merged = dict(light_style)
+                    merged.update(item)
+                    wff = merged.get("weightedFontFamily") or {}
+                    family = wff.get("fontFamily") or merged.get("fontFamily") or brand_family
+                    weight = wff.get("weight")
+                    if weight is None:
+                        weight = brand_weight if brand_weight is not None else 300
+                    merged["fontFamily"] = str(family)
+                    merged["weightedFontFamily"] = {
+                        "fontFamily": str(family),
+                        "weight": int(weight),
+                    }
+                    return merged
+                base = dict(light_style)
+                base.update(item)
+                return base
+
             if existing is None:
-                styles["body"] = [None, dict(overlay_style)]
+                styles["body"] = [_ensure_light(None) for _ in range(n)]
             elif isinstance(existing, list):
-                merged = list(existing) + [None] * (len(fields_body) - len(existing))
-                if merged[1] is None:
-                    merged[1] = dict(overlay_style)
-                elif isinstance(merged[1], dict) and not (
-                    merged[1].get("fontFamily") or merged[1].get("weightedFontFamily")
-                ):
-                    base = dict(overlay_style)
-                    base.update(merged[1])
-                    merged[1] = base
-                styles["body"] = merged[: len(fields_body)]
+                merged = list(existing) + [None] * (n - len(existing))
+                styles["body"] = [_ensure_light(merged[i]) for i in range(n)]
+            elif isinstance(existing, dict):
+                styles["body"] = [_ensure_light(existing) for _ in range(n)]
 
         # Do NOT stamp TITLE fonts — placeholders inherit the template theme.
         # Agent can set styles.title / text_defaults when a one-off override is needed.
@@ -597,7 +620,12 @@ def collect_capacity_findings(
 
 
 def _looks_risky_image_url(url: str) -> Optional[str]:
-    """Return a skip reason for URLs Google Slides cannot fetch, else None."""
+    """Return a skip reason for URLs Google Slides cannot fetch, else None.
+
+    Note: public app file routes like `https://wegen…/api/file/<id>` are NOT
+    treated as risky — they are anonymously fetchable (no cookies). We still
+    HEAD/GET-check them in preflight.
+    """
     if not url:
         return "empty url"
     u = url.lower().strip()
@@ -607,48 +635,54 @@ def _looks_risky_image_url(url: str) -> Optional[str]:
         return "localhost is unreachable from Google's image fetcher"
     if re.match(r"https?://(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)", u):
         return "private/LAN IP is unreachable from Google's image fetcher"
-    if "/api/file/" in u:
-        return "app-auth /api/file/ URLs require cookies Google does not send"
     if u.endswith(".svg") or ".svg?" in u:
         return "external SVG is often rejected by Slides"
     return None
 
 
 async def preflight_image_urls(deck: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Drop image URLs that are clearly unfetchable; HEAD-check the rest.
+    """Drop image URLs that are clearly unfetchable; HEAD/GET-check the rest.
 
     Mutates a deep copy: bad `image_placeholders` entries and free `image`
     blocks are removed (or the whole field dropped). Reports every decision.
+    Public `/api/file/` routes are allowed through when HEAD/GET succeeds.
     """
     out = copy.deepcopy(deck)
     report: List[Dict[str, Any]] = []
 
-    async def _head_ok(url: str) -> Tuple[bool, str]:
+    async def _probe_ok(url: str) -> Tuple[bool, str]:
         risky = _looks_risky_image_url(url)
         if risky:
             return False, risky
 
-        def _do_head() -> Tuple[bool, str]:
-            req = urllib.request.Request(
-                url,
-                method="HEAD",
-                headers={"User-Agent": "google-workspace-mcp-preflight/1.0"},
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=4) as resp:
-                    code = getattr(resp, "status", None) or resp.getcode()
-                    if code and 200 <= int(code) < 400:
-                        return True, f"HEAD {code}"
-                    return False, f"HEAD {code}"
-            except urllib.error.HTTPError as e:
-                # Some CDNs reject HEAD but allow GET — treat 405 as inconclusive OK.
-                if e.code in (405, 403, 401):
-                    return True, f"HEAD {e.code} (inconclusive — keeping URL)"
-                return False, f"HEAD HTTP {e.code}"
-            except Exception as e:
-                return True, f"HEAD failed ({type(e).__name__}) — keeping URL"
+        def _do_probe() -> Tuple[bool, str]:
+            headers = {"User-Agent": "google-workspace-mcp-preflight/1.0"}
+            # Prefer HEAD; fall back to GET (some app file routes reject HEAD).
+            for method in ("HEAD", "GET"):
+                req = urllib.request.Request(url, method=method, headers=headers)
+                try:
+                    with urllib.request.urlopen(req, timeout=6) as resp:
+                        code = getattr(resp, "status", None) or resp.getcode()
+                        if code and 200 <= int(code) < 400:
+                            return True, f"{method} {code}"
+                        if method == "HEAD":
+                            continue
+                        return False, f"{method} {code}"
+                except urllib.error.HTTPError as e:
+                    # 401/403/405 on HEAD → try GET; on GET keep URL only if
+                    # inconclusive (some CDNs block our UA but allow Google).
+                    if method == "HEAD" and e.code in (401, 403, 405, 501):
+                        continue
+                    if e.code in (401, 403, 405):
+                        return True, f"{method} {e.code} (inconclusive — keeping URL)"
+                    return False, f"{method} HTTP {e.code}"
+                except Exception as e:
+                    if method == "HEAD":
+                        continue
+                    return True, f"probe failed ({type(e).__name__}) — keeping URL"
+            return True, "probe inconclusive — keeping URL"
 
-        return await asyncio.to_thread(_do_head)
+        return await asyncio.to_thread(_do_probe)
 
     for slide_idx, slide in enumerate(out.get("slides") or []):
         # image_placeholders
@@ -659,7 +693,7 @@ async def preflight_image_urls(deck: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
                 url = item if isinstance(item, str) else (item or {}).get("url")
                 if not url:
                     continue
-                ok, reason = await _head_ok(str(url))
+                ok, reason = await _probe_ok(str(url))
                 entry = {
                     "slide": slide_idx + 1,
                     "kind": "image_placeholder",
@@ -684,7 +718,7 @@ async def preflight_image_urls(deck: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         image = slide.get("image")
         if isinstance(image, dict) and image.get("url"):
             url = str(image["url"])
-            ok, reason = await _head_ok(url)
+            ok, reason = await _probe_ok(url)
             report.append(
                 {
                     "slide": slide_idx + 1,
