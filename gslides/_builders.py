@@ -1576,6 +1576,17 @@ def build_slide_with_placeholders(
     elif body_value:
         body_texts = [str(body_value)]
 
+    has_table = bool(slide_spec.get("table"))
+    # Title + Table (and similar): BODY is the table frame. If the agent also
+    # sends fields.body, that text lands in the same placeholder *under* the
+    # table — unreadable overlap. Prefer the table; soft-skip the body.
+    if has_table and any(t.strip() for t in body_texts):
+        skipped_fields.append(
+            "body (ignored: table occupies BODY on this layout — omit fields.body "
+            "on Title + Table, or put narrative on a Title + Body slide)"
+        )
+        body_texts = []
+
     # body indexes that should be rendered as a free-floating TEXT_BOX
     # overlay (workaround for the Slides multi-BODY ghost bug). We track
     # i -> (overlay_object_id, size, transform) so the content-building
@@ -1588,13 +1599,10 @@ def build_slide_with_placeholders(
 
         # Multi-occurrence custom-layout BODY placeholders: the FIRST one
         # (occurrence 0) accepts text via the deferred-rebind path. Every
-        # subsequent BODY placeholder of the same layout is created in a
-        # corrupt "ghost" state by Slides — `insertText` against it always
-        # returns HTTP 500 regardless of how the objectId was bound. Bypass
-        # the broken placeholder by laying a free-floating TEXT_BOX shape
-        # over its layout-defined geometry. The slide-level placeholder
-        # remains underneath but is empty, so its prompt is hidden behind
-        # our text box (and prompts never render in present mode).
+        # subsequent BODY is a Slides "ghost" — insertText → HTTP 500. Bypass
+        # with a TEXT_BOX overlay at the layout geometry, and bind+delete the
+        # ghost so its "Click to add text" prompt cannot show through the
+        # transparent text box.
         if (
             discovered_layout_id
             and i >= 1
@@ -1605,6 +1613,8 @@ def build_slide_with_placeholders(
             )
             if geom is not None:
                 size, transform = geom
+                # Bind so Phase B can deleteObject the ghost placeholder.
+                _allocate_placeholder("BODY", i, f"body_unused[{i}]")
                 overlay_id = gen_id("body_tb")
                 placeholder_ids[f"body[{i}]"] = overlay_id
                 body_overlays[i] = (overlay_id, size, transform)
@@ -1616,10 +1626,8 @@ def build_slide_with_placeholders(
         if allocated is None:
             skipped_fields.append(f"body[{i}] (BODY)")
 
-    # Title + Table (and similar): layout still exposes a BODY placeholder.
-    # If the deck only supplies a `table` (no body text), that BODY stays as
-    # the grey "Click to add text" prompt behind the table. Bind + delete it.
-    has_table = bool(slide_spec.get("table"))
+    # Title + Table: layout still exposes a BODY placeholder. With no body
+    # text, bind + delete it so the grey "Click to add text" never shows.
     if has_table and not body_texts:
         n_body = len(layout_placeholders_by_type.get("BODY") or [])
         # If we couldn't discover placeholders, still try BODY occurrence 0.
@@ -1700,11 +1708,20 @@ def build_slide_with_placeholders(
 
         overlay = body_overlays.get(i)
         if overlay is not None:
-            # Multi-BODY ghost-bug workaround: emit a TEXT_BOX overlay at
-            # the layout's body[i] geometry, then insertText into it. The
-            # underlying broken slide-level placeholder is left alone but
-            # is empty; our overlay covers its prompt visually.
+            # Multi-BODY ghost-bug workaround: TEXT_BOX overlay + delete of the
+            # bound ghost placeholder (see body_unused delete above). Soft-default
+            # Roboto Light when the agent omitted styles — TEXT_BOX can't inherit.
             overlay_id, size, transform = overlay
+            if not style or not (
+                style.get("fontFamily") or style.get("weightedFontFamily")
+            ):
+                base = {
+                    "fontFamily": "Roboto",
+                    "weightedFontFamily": {"fontFamily": "Roboto", "weight": 300},
+                }
+                if isinstance(style, dict):
+                    base.update(style)
+                style = base
             content_requests.append(
                 {
                     "createShape": {

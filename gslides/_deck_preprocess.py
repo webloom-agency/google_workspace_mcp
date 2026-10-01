@@ -255,9 +255,9 @@ def apply_text_defaults(
     explicit_text = isinstance(user_text_defaults, dict) and bool(user_text_defaults)
     text_defaults = dict(user_text_defaults or {})
 
-    # Agent-owned typography. No brand coercion — pass through what the deck asks for.
-    # Tip: Slides has no "Roboto Light" family name; use font_family="Roboto" +
-    # font_weight=300 (builders also accept the friendly alias).
+    # Agent-owned typography when set. Tables + TEXT_BOX overlays cannot inherit
+    # the live theme — soft-default Roboto Light when the agent omitted fonts
+    # (otherwise Slides falls back to Arial). No Inter→Roboto coercion.
     brand_family = (
         text_defaults.get("font_family")
         or (out.get("table_defaults") or {}).get("font_family")
@@ -270,18 +270,25 @@ def apply_text_defaults(
         brand_family = "Roboto"
         if brand_weight is None:
             brand_weight = 300
+    if not brand_family:
+        brand_family = "Roboto"
+        if brand_weight is None:
+            brand_weight = 300
     body_size = (
         text_defaults.get("body_font_size")
         or text_defaults.get("font_size")
         or theme.body_font_size
+        or 11
     )
 
-    # --- table_defaults: seed colors; fonts only when the deck asked ---
+    # --- table_defaults: seed fonts (soft) + theme colors ---
     table_defaults = dict(out.get("table_defaults") or {})
-    if brand_family and not table_defaults.get("font_family"):
+    if not table_defaults.get("font_family"):
         table_defaults["font_family"] = brand_family
-    if brand_weight is not None and "font_weight" not in table_defaults:
-        table_defaults["font_weight"] = brand_weight
+    if "font_weight" not in table_defaults:
+        table_defaults["font_weight"] = (
+            brand_weight if brand_weight is not None else 300
+        )
     if body_size is not None and "font_size" not in table_defaults:
         try:
             table_defaults["font_size"] = min(float(body_size), 12.0)
