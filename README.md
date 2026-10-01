@@ -886,6 +886,22 @@ fonts. The template is **never modified**.
     "title_text_format": { "bold": true, "font_size": 14, "foreground_color": "#202124" },
     "legend_position": "BOTTOM_LEGEND"
   },
+  "table_defaults": {
+    "font_family": "Roboto",
+    "font_weight": 300,
+    "font_size": 11,
+    "row_height": 28,
+    "border_color": "#DADCE0",
+    "header_underline": true,
+    "column_roles": ["label", "metric", "narrative"],
+    "header_style": { "bold": true }
+  },
+  "text_defaults": {
+    "font_family": "Roboto",
+    "font_weight": 300,
+    "body_font_size": 12,
+    "title_font_size": 22
+  },
   "slides": [
     {
       "layout": "Cover",
@@ -950,7 +966,7 @@ fonts. The template is **never modified**.
           ["Trafic mensuel", "8 847", "11 000", "+24 %"],
           ["CA mensuel (€)", "176 940", "220 000", "+24 %"]
         ],
-        "position": { "x": 40, "y": 95, "w": 640, "h": 280 }
+        "position": { "x": 40, "y": 95, "w": 640 }
       }
     },
     {
@@ -971,7 +987,7 @@ fonts. The template is **never modified**.
 | `styles` | Per-field text style overrides. Each value is a Slides API `TextStyle` dict (`{fontFamily, fontSize:{magnitude,unit}, bold, italic, foregroundColor, ...}`). For two-column layouts, `styles.body` may be an **array** aligned with the body texts; `null` keeps the placeholder default for that slot. **Always set `styles.body[1]` on Two Columns layouts** — the right column renders as an overlay and won't inherit the master style otherwise. |
 | `image_placeholders` | List of items targeting **PICTURE placeholders** ("espace réservé image") in the layout. Each item is either a URL string or `{"url": "...", "method": "CENTER_INSIDE"\|"CENTER_CROP"}`. Item `i` fills the PICTURE at layout index `i`. PICTURE placeholders defined as either `shape` or `image` page elements are both detected. **The URL must be fetchable by Google's servers without cookies or auth headers** — signed app URLs (`/api/file/…`), session-gated CDNs, and localhost all render as a broken-image icon even when `batchUpdate` returns 200. Prefer a public HTTPS PNG/JPEG, or a Drive file with \"Anyone with the link can view\" and a direct file URL. |
 | `title` (top-level, on `BLANK`) | Adds a free-floating title text box. |
-| `table` | `{headers, rows, position?, header_style?, body_style?}` — creates a real `Table` element you can re-style by hand later. |
+| `table` | `{headers, rows, position?, column_widths?, font_family?, font_weight?, font_size?, row_height?, border_color?, header_style?, body_style?}` — creates a real `Table` element. **Height defaults to content-fit** (row_count × row_height); do not pass a huge `h` unless you want stretched rows. Cells may be strings or `{text, link?, color?}` for accents. Deck-level `table_defaults` (or `chart_defaults.font_family`) apply when omitted. |
 | `chart` | `{type, title?, data:{headers, rows}, position?, linking_mode?, value_axis_title?, domain_axis_title?, legend_position?, series_colors?, stacked_type?, series_types?}` — native Sheets chart embedded on the slide. **Default `linking_mode` is `NOT_LINKED_IMAGE`** (static snapshot at build time; no spreadsheet access needed when viewing the deck — recommended for client-facing audits). Set `linking_mode: "LINKED"` (or deck-level `chart_linking_mode: "LINKED"`) only when every viewer can **read** the auxiliary data spreadsheet; otherwise Slides shows a broken-chart placeholder. |
 | `image` | `{url, position?}` — free-floating image, **not** a placeholder. Must be a publicly accessible URL. Use this when the layout has no PICTURE placeholder, or when you want pixel control. |
 | `text_boxes` | List of `{text, position?, style?, alignment?}` for free placement. `alignment` ∈ `START` \| `CENTER` \| `END` \| `JUSTIFIED`. |
@@ -1024,6 +1040,33 @@ Embedded Sheets charts do **not** automatically inherit your Slides template's t
 | `title_text_format` | All chart types | `{bold, italic, font_size, font_family, foreground_color}` — all keys optional. |
 | `legend_position` | All chart types | `BOTTOM_LEGEND` (default), `LEFT_LEGEND`, `RIGHT_LEGEND`, `TOP_LEGEND`, `NO_LEGEND`. |
 | `stacked_type` | Bar / Column / Area only | `NONE`, `STACKED`, `PERCENT_STACKED`. Ignored for other chart types. |
+
+#### Table styling (compact rows, theme font, clean headers)
+
+Programmatic tables do **not** inherit the Slides theme font automatically (tables are not placeholders). Borders/fills **do** use theme color tokens (`DARK1`, `LIGHT2`, …) by default so they track your template's color scheme. Fonts are snapshotted from the template BODY placeholder at build time — **rebuild the deck after changing the theme font**.
+
+Height used to default to nearly the full slide (stretched rows). Defaults are now content-fit + thin theme borders + bold headers.
+
+1. **Prefer omitting fonts** so the tool reads the template master. Only set `table_defaults.font_family` / `text_defaults` when you intentionally override the brand.
+
+2. **Omit `position.h`** so height = `rows × row_height`. Pass `w` (and optionally `column_roles` / `column_widths`).
+
+3. **Accent a cell** with `{"text": "0", "color": "#C5221F"}` or a theme token like `"ACCENT1"`.
+
+| Style field | Notes |
+|---|---|
+| `font_family` / `font_weight` | Snapshotted from template BODY when omitted. `font_weight: 300` → Light. |
+| `border_color` / `text_color` / `zebra_color` | Theme tokens (`DARK2`, `DARK1`, `LIGHT2`) or `#RRGGBB`. |
+| `header_underline` | Default `true` — thicker bottom border under the header row. |
+| `column_roles` | `label` / `metric` / `narrative` — widths + alignment. |
+| Section rows | `{"section": "Engagement"}` in `rows`. |
+| Inline bold | `**bold**` in cell text. |
+
+Deck-level `text_defaults` is optional. **Leave it out** so TITLE/BODY placeholders keep inheriting the master (theme edits in the editor stay live). Two-Columns `body[1]` overlays still get a theme-font snapshot (API limitation).
+
+`validate_only: true` runs layout validation + capacity audit + preprocess without building.
+
+The tool response includes `capacity_warnings`, `soft_skips`, `auto_split`, `theme_font`, and `image_preflight_dropped`.
 
 #### Authoring tips & gotchas
 

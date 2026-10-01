@@ -463,6 +463,65 @@ _CHART_STYLE_FIELDS = (
     "stacked_type",
 )
 
+# Friendly keys that flow from deck.table_defaults into each slide's table block.
+# Per-table values always win. font_family also falls back to chart_defaults.font_family
+# so a single deck-level brand font covers charts + tables.
+_TABLE_DEFAULT_KEYS = (
+    "font_family",
+    "font_weight",
+    "font_size",
+    "row_height",
+    "border_color",
+    "border_weight",
+    "header_background",
+    "header_underline",
+    "header_underline_color",
+    "header_style",
+    "body_style",
+    "column_widths",
+    "column_roles",
+    "column_align",
+    "zebra",
+    "zebra_color",
+    "text_color",
+    "section_background",
+)
+
+
+def _effective_table_spec(
+    table_defaults: Optional[Dict[str, Any]],
+    table_spec: Dict[str, Any],
+    chart_defaults: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Merge deck-level table_defaults under a per-slide table block.
+
+    Per-table keys win. If neither table nor table_defaults set `font_family`,
+    reuse `chart_defaults.font_family` so brand typography stays consistent.
+    """
+    merged: Dict[str, Any] = {}
+    if table_defaults:
+        for key in _TABLE_DEFAULT_KEYS:
+            if key in table_defaults and table_defaults[key] is not None:
+                merged[key] = table_defaults[key]
+    # Shallow-merge style dicts so deck defaults + per-table overrides compose.
+    for style_key in ("header_style", "body_style"):
+        base = dict(merged.get(style_key) or {})
+        override = table_spec.get(style_key)
+        if isinstance(override, dict):
+            base.update(override)
+            merged[style_key] = base
+        elif style_key in table_spec:
+            merged[style_key] = table_spec[style_key]
+    for key, value in table_spec.items():
+        if key in ("header_style", "body_style"):
+            continue
+        merged[key] = value
+    if not merged.get("font_family") and not merged.get("fontFamily"):
+        fallback = (chart_defaults or {}).get("font_family")
+        if fallback:
+            merged["font_family"] = fallback
+    return merged
+
 
 def _hex_to_rgb_color(hex_color: str) -> Dict[str, float]:
     """'#1A73E8' -> {'red': 0.10..., 'green': 0.45..., 'blue': 0.91...}."""
@@ -1036,6 +1095,7 @@ async def _execute_slides_per_slide(
     presentation_id: str,
     per_slide_requests: List[Tuple[int, List[Dict[str, Any]]]],
     on_slide_done: Optional[Any] = None,
+    soft_skips: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Run Slides content requests one slide at a time.
 
@@ -1048,9 +1108,14 @@ async def _execute_slides_per_slide(
 
     Each chunk goes through the per-call transient-retry helper, so a flake on
     slide N does not abort the whole tool.
+
+    Soft-skipped requests (broken images, stubborn 5xx singles) are appended
+    to ``soft_skips`` when provided so the MCP response can summarize them.
     """
     if not per_slide_requests:
         return
+    if soft_skips is None:
+        soft_skips = []
     # Per-chunk retry budget tuned for 429 quota windows.
     #
     # Slides enforces "Write requests per minute per user" = 60 (default). On
@@ -1179,6 +1244,14 @@ async def _execute_slides_per_slide(
                                 f"the per-batch retry budget. Skipping it so the rest of "
                                 f"the deck can complete. Request body: {req_dump}"
                             )
+                            soft_skips.append(
+                                {
+                                    "slide": slide_idx + 1,
+                                    "kind": next(iter(single_req.keys()), "request"),
+                                    "status": sub_status,
+                                    "reason": "persistent 5xx after retries — request skipped",
+                                }
+                            )
                             continue
                         # Bad image (hallucinated URL, 403 forbidden / CDN
                         # auth wall, unsupported format, SVG-only host, image
@@ -1196,6 +1269,15 @@ async def _execute_slides_per_slide(
                                 f"[create_audit_presentation:{sub_label}] Skipping image "
                                 f"(HTTP {sub_status}). The rest of the deck will still be "
                                 f"generated. URL: {bad_url}. Slides API said: {slides_msg_str}"
+                            )
+                            soft_skips.append(
+                                {
+                                    "slide": slide_idx + 1,
+                                    "kind": "image",
+                                    "status": sub_status,
+                                    "url": bad_url[:200],
+                                    "reason": slides_msg_str or "image soft-skip",
+                                }
                             )
                             continue
                         # 4xx and other errors are real bugs in the request
@@ -1325,6 +1407,7 @@ async def create_audit_presentation(
     cleanup_data_sheet: bool = False,
     keep_template_slides: bool = False,
     keep_on_error: bool = False,
+    validate_only: bool = False,
 ) -> str:
     """
     Build a full Google Slides deck from a structured JSON payload, copying a template for branding.
@@ -1351,6 +1434,14 @@ async def create_audit_presentation(
           "legend_position": "BOTTOM_LEGEND",
           "stacked_type": "STACKED"                   # NONE | STACKED | PERCENT_STACKED
         },
+        "table_defaults": {                           # optional — omit fonts to use template theme
+          "header_underline": true,
+          "column_roles": ["label", "metric", "narrative"]
+        },
+        # border_color / text_color default to theme tokens DARK2 / DARK1.
+        # Omit text_defaults so placeholders inherit the master live.
+        # Only set text_defaults when you intentionally override the theme.
+        "auto_split": true,
         "slides": [
           {"layout": "TITLE", "fields": {"title": "...", "subtitle": "..."}},
           # Inline `**bold**` runs are parsed and rendered as bold; emojis pass through.
@@ -1432,11 +1523,16 @@ async def create_audit_presentation(
             which slides made it and inspect the resulting placeholder/objectId state. Default
             False so production retries don't accumulate orphan files. The presentation_id of
             the kept partial is logged at WARNING level so it's easy to find.
+        validate_only: If True, run layout validation + capacity audit + preprocess (auto-split,
+            chart positions, text_defaults, image preflight) and return the report **without**
+            copying the template or building slides. Fast iteration for agents.
 
     Returns:
         str: JSON string with presentation_id, presentation_url, slide_count, data_sheet_url,
-        folder_id, message.
+        folder_id, capacity_warnings, soft_skips, preprocess notes, message.
     """
+    from gslides._deck_preprocess import preprocess_deck
+
     if not isinstance(template_presentation_id, str) or not template_presentation_id.strip():
         raise Exception(
             "'template_presentation_id' is required and must be a non-empty Drive file ID "
@@ -1456,22 +1552,14 @@ async def create_audit_presentation(
 
     logger.info(
         f"[create_audit_presentation] Email: '{user_google_email}', Template: "
-        f"{template_presentation_id}, Deck title: '{deck_title}', Slides: {len(slides)}"
+        f"{template_presentation_id}, Deck title: '{deck_title}', Slides: {len(slides)}, "
+        f"validate_only={validate_only}"
     )
-
-    # Capacity audit (non-blocking). Emits WARNING / INFO log lines for any
-    # slide whose text or table content exceeds the layout's safe capacity
-    # (per `gslides/AGENT_SYSTEM_PROMPT.md` rule #11). The build proceeds
-    # regardless — these warnings just surface "this slide will overflow
-    # or auto-shrink to illegibility" so the agent's output can be tightened
-    # on the next iteration. Cheap heuristic, runs in ~1ms even for 100
-    # slide decks.
-    _audit_deck_capacity(slides)
 
     await _report_progress(
         progress=0,
         total=100,
-        message=f"Starting build of {len(slides)} slide(s)…",
+        message=f"Starting {'validation' if validate_only else 'build'} of {len(slides)} slide(s)…",
     )
 
     # 0) Pre-flight: read the TEMPLATE's layouts directly and validate every
@@ -1519,6 +1607,35 @@ async def create_audit_presentation(
         f"Unicode in displayName): "
         f"{json.dumps(template_layouts_trace, ensure_ascii=False)}"
     )
+
+    # Preprocess BEFORE layout validation so auto-split slides are also checked.
+    pre = await preprocess_deck(
+        deck,
+        presentation_meta=template_meta,
+        audit_fn=_audit_slide_capacity,
+        run_image_preflight=True,
+    )
+    deck = pre.deck
+    slides = deck.get("slides") or []
+    deck_title = (deck.get("title") or "").strip() or deck_title
+
+    if pre.split_notes:
+        for note in pre.split_notes:
+            logger.info(f"[create_audit_presentation] {note}")
+    if pre.theme_font:
+        logger.info(
+            f"[create_audit_presentation] Theme font detected: {pre.theme_font!r}"
+        )
+    if pre.inferred_chart_positions:
+        logger.info(
+            f"[create_audit_presentation] Inferred chart position for "
+            f"{pre.inferred_chart_positions} chart(s) from layout name."
+        )
+    # Capacity audit (non-blocking) — also returned to the MCP client.
+    _audit_deck_capacity(slides)
+    hard_warnings = [f for f in pre.capacity_findings if f.get("severity") == "HARD"]
+    soft_warnings = [f for f in pre.capacity_findings if f.get("severity") == "SOFT"]
+
     # Also log the EXACT slide layout names from the deck JSON for side-by-side
     # comparison with the template_layouts_trace dump above.
     requested_layouts = sorted({(s.get("layout") or "BLANK") for s in slides})
@@ -1537,6 +1654,37 @@ async def create_audit_presentation(
         raise Exception(
             "Layout validation failed before any Drive operation:\n"
             + "\n".join(layout_errors)
+        )
+
+    dropped_images = [r for r in pre.image_preflight if not r.get("kept")]
+    if validate_only:
+        await _report_progress(progress=100, total=100, message="Validation complete.")
+        return json.dumps(
+            {
+                "validate_only": True,
+                "title": deck_title,
+                "slide_count": len(slides),
+                "theme_font": pre.theme_font,
+                "inferred_chart_positions": pre.inferred_chart_positions,
+                "auto_split": pre.split_notes,
+                "capacity_warnings": pre.capacity_findings,
+                "capacity_summary": {
+                    "hard": len(hard_warnings),
+                    "soft": len(soft_warnings),
+                },
+                "image_preflight": pre.image_preflight,
+                "images_dropped": dropped_images,
+                "available_layouts": [
+                    t.get("displayName") or t.get("name") for t in template_layouts_trace
+                ],
+                "message": (
+                    f"Validation OK for '{deck_title}': {len(slides)} slide(s) after preprocess. "
+                    f"Capacity: {len(hard_warnings)} hard / {len(soft_warnings)} soft. "
+                    f"Images dropped: {len(dropped_images)}. "
+                    f"Auto-split notes: {len(pre.split_notes)}."
+                ),
+            },
+            indent=2,
         )
 
     # 1) Resolve target folder (if any) BEFORE the copy so we can do `if_exists` checks.
@@ -1605,6 +1753,7 @@ async def create_audit_presentation(
     )
 
     data_sheet_meta: Optional[Dict[str, Any]] = None
+    soft_skips: List[Dict[str, Any]] = []
     try:
         # 4) Move the deck into the target folder (if any).
         if target_folder_id:
@@ -1621,6 +1770,7 @@ async def create_audit_presentation(
         # 6) If any slide needs a chart, build the data Sheet first.
         flat_chart_specs = _annotate_chart_uids(deck)
         chart_defaults = deck.get("chart_defaults") or None
+        table_defaults = deck.get("table_defaults") or None
         chart_id_by_uid: Dict[str, int] = {}
         if flat_chart_specs:
             data_sheet_meta, chart_pairs = await _create_data_sheet_and_charts(
@@ -1770,6 +1920,14 @@ async def create_audit_presentation(
         all_deferred_lookups: Dict[str, Tuple[str, str, int]] = {}
 
         for index, slide_spec in enumerate(slides):
+            # Apply deck-level table_defaults (font, borders, compact row height)
+            # under each slide's table block before request generation.
+            slide_for_build = slide_spec
+            if isinstance(slide_spec.get("table"), dict):
+                slide_for_build = dict(slide_spec)
+                slide_for_build["table"] = _effective_table_spec(
+                    table_defaults, slide_spec["table"], chart_defaults
+                )
             (
                 slide_id,
                 slide_creation,
@@ -1778,7 +1936,7 @@ async def create_audit_presentation(
                 slide_deferred_lookups,
             ) = B.build_slide_with_placeholders(
                 presentation=presentation,
-                slide_spec=slide_spec,
+                slide_spec=slide_for_build,
                 insertion_index=slide_offset + index,
             )
             slide_id_index_pairs.append((slide_id, index))
@@ -2057,11 +2215,13 @@ async def create_audit_presentation(
                 message=f"Phase B: filled slide {done}/{total}",
             )
 
+        soft_skips.clear()
         await _execute_slides_per_slide(
             slides_service,
             presentation_id,
             per_slide_content,
             on_slide_done=_phase_b_progress,
+            soft_skips=soft_skips,
         )
 
         # 8) Speaker notes pass: re-fetch to find each slide's speakerNotesObjectId, then insert.
@@ -2167,6 +2327,16 @@ async def create_audit_presentation(
             f"Data sheet with {data_sheet_meta['chart_count']} chart(s): "
             f"{data_sheet_meta['spreadsheet_url']}."
         )
+    if pre.split_notes:
+        message_parts.append(f"Auto-split: {len(pre.split_notes)} adjustment(s).")
+    if hard_warnings or soft_warnings:
+        message_parts.append(
+            f"Capacity: {len(hard_warnings)} hard / {len(soft_warnings)} soft warning(s)."
+        )
+    if soft_skips:
+        message_parts.append(f"Soft-skipped {len(soft_skips)} request(s) during build.")
+    if dropped_images:
+        message_parts.append(f"Image preflight dropped {len(dropped_images)} URL(s).")
 
     result = {
         "presentation_id": presentation_id,
@@ -2177,6 +2347,16 @@ async def create_audit_presentation(
         "folder_id": target_folder_id,
         "folder_path": folder_path_summary or None,
         "title": final_title,
+        "theme_font": pre.theme_font,
+        "inferred_chart_positions": pre.inferred_chart_positions,
+        "auto_split": pre.split_notes,
+        "capacity_warnings": pre.capacity_findings,
+        "capacity_summary": {
+            "hard": len(hard_warnings),
+            "soft": len(soft_warnings),
+        },
+        "image_preflight_dropped": dropped_images,
+        "soft_skips": soft_skips,
         "message": " ".join(message_parts),
     }
 

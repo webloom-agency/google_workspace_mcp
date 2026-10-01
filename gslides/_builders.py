@@ -497,44 +497,420 @@ def build_create_slide(
     return req
 
 
+# Compact table defaults — Google createTable *honors* size, so a near-full-slide
+# height stretches every row. Prefer content-fit height + thin borders + bold
+# headers (no heavy header fill) so tables match clean audit-deck typography.
+_TABLE_DEFAULT_ROW_H_PT = 28.0
+_TABLE_DEFAULT_FONT_SIZE_PT = 11.0
+_TABLE_DEFAULT_BORDER_PT = 0.75
+_TABLE_DEFAULT_BORDER_COLOR = "DARK2"  # themeColor — tracks template theme
+_TABLE_MIN_COL_W_PT = 32.0  # Slides API floor for columnWidth
+_TABLE_DEFAULT_PAD_X_PT = 40.0
+_TABLE_DEFAULT_PAD_Y_PT = 90.0
+
+_THEME_COLOR_NAMES = frozenset(
+    {
+        "DARK1",
+        "LIGHT1",
+        "DARK2",
+        "LIGHT2",
+        "ACCENT1",
+        "ACCENT2",
+        "ACCENT3",
+        "ACCENT4",
+        "ACCENT5",
+        "ACCENT6",
+        "HYPERLINK",
+        "FOLLOWED_HYPERLINK",
+        "TEXT1",
+        "TEXT2",
+        "BACKGROUND1",
+        "BACKGROUND2",
+    }
+)
+
+
+def _hex_to_slides_rgb(hex_color: str) -> Dict[str, float]:
+    """'#DADCE0' -> {'red': …, 'green': …, 'blue': …} for Slides solidFill/opaqueColor."""
+    h = str(hex_color).lstrip("#").strip()
+    if len(h) != 6:
+        raise ValueError(f"Invalid HEX color '{hex_color}'. Expected #RRGGBB.")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return {"red": r / 255.0, "green": g / 255.0, "blue": b / 255.0}
+
+
+def _slides_color_value(color: str) -> Dict[str, Any]:
+    """Accept `#RRGGBB` or a Slides ThemeColorType name (`DARK1`, `ACCENT1`, …)."""
+    raw = str(color).strip()
+    if raw.startswith("#"):
+        return {"rgbColor": _hex_to_slides_rgb(raw)}
+    name = raw.upper().replace(" ", "_")
+    if name in _THEME_COLOR_NAMES:
+        return {"themeColor": name}
+    raise ValueError(
+        f"Invalid color '{color}'. Use #RRGGBB or a theme token "
+        f"({', '.join(sorted(_THEME_COLOR_NAMES))})."
+    )
+
+
+def _slides_opaque_color(color: str) -> Dict[str, Any]:
+    return {"opaqueColor": _slides_color_value(color)}
+
+
+def _slides_solid_fill(color: str, alpha: Optional[float] = None) -> Dict[str, Any]:
+    solid: Dict[str, Any] = {"color": _slides_color_value(color)}
+    if alpha is not None:
+        solid["alpha"] = float(alpha)
+    return {"solidFill": solid}
+
+
+def _normalize_table_text_style(
+    style: Optional[Dict[str, Any]],
+    *,
+    font_family: Optional[str] = None,
+    font_weight: Optional[int] = None,
+    font_size_pt: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build a Slides TextStyle dict, accepting either API keys or friendly aliases.
+
+    Friendly keys: font_family, font_weight (100–900), font_size, color (#RRGGBB),
+    bold, italic. API keys (fontFamily, weightedFontFamily, fontSize, …) pass through.
+    """
+    out: Dict[str, Any] = {}
+    src = dict(style or {})
+
+    # Friendly → API
+    if "font_family" in src and "fontFamily" not in src and "weightedFontFamily" not in src:
+        src["fontFamily"] = src.pop("font_family")
+    else:
+        src.pop("font_family", None)
+    if "font_weight" in src and "weightedFontFamily" not in src:
+        # Defer: applied below once font family is known.
+        pass
+    if "font_size" in src and "fontSize" not in src:
+        src["fontSize"] = {"magnitude": float(src.pop("font_size")), "unit": "PT"}
+    else:
+        src.pop("font_size", None)
+    if "color" in src and "foregroundColor" not in src:
+        try:
+            src["foregroundColor"] = _slides_opaque_color(str(src.pop("color")))
+        except ValueError:
+            src.pop("color", None)
+    else:
+        src.pop("color", None)
+
+    for key, value in src.items():
+        if key in ("font_weight",) or value is None:
+            continue
+        out[key] = value
+
+    family = (
+        (out.get("weightedFontFamily") or {}).get("fontFamily")
+        or out.get("fontFamily")
+        or font_family
+    )
+    weight = src.get("font_weight", font_weight)
+    if family and weight is not None and "weightedFontFamily" not in out:
+        out["weightedFontFamily"] = {
+            "fontFamily": str(family),
+            "weight": int(weight),
+        }
+        out.pop("fontFamily", None)
+    elif family and "fontFamily" not in out and "weightedFontFamily" not in out:
+        out["fontFamily"] = str(family)
+
+    if font_size_pt is not None and "fontSize" not in out:
+        out["fontSize"] = {"magnitude": float(font_size_pt), "unit": "PT"}
+
+    return out
+
+
+def _estimate_col_widths(
+    all_rows: List[List[Any]],
+    n_cols: int,
+    total_w_pt: float,
+    explicit: Optional[List[float]] = None,
+) -> List[float]:
+    """Distribute `total_w_pt` across columns.
+
+    Prefer explicit widths (pts or fractions summing ~1). Otherwise weight by
+    max cell character length so narrative columns get more room (reduces wrap
+    overflow). Every column respects the Slides 32pt minimum.
+    """
+    usable = max(total_w_pt, _TABLE_MIN_COL_W_PT * n_cols)
+
+    if explicit and len(explicit) == n_cols:
+        vals = [float(v) for v in explicit]
+        total = sum(vals) or 1.0
+        # Fractions (sum ≈ 1) vs absolute points.
+        if 0.5 <= total <= 1.5:
+            widths = [max(_TABLE_MIN_COL_W_PT, v / total * usable) for v in vals]
+        else:
+            widths = [max(_TABLE_MIN_COL_W_PT, v) for v in vals]
+        # Renormalize if mins pushed us over/under.
+        scale = usable / (sum(widths) or 1.0)
+        return [w * scale for w in widths]
+
+    weights = [1.0] * n_cols
+    for row in all_rows:
+        for c in range(n_cols):
+            raw = row[c] if c < len(row) else ""
+            if isinstance(raw, dict):
+                text = raw.get("text")
+                if text is None:
+                    text = raw.get("label") or raw.get("value") or ""
+            else:
+                text = "" if raw is None else str(raw)
+            # Soft cap so one huge cell doesn't starve siblings.
+            weights[c] = max(weights[c], min(len(str(text)), 80) + 4.0)
+
+    total_w = sum(weights) or float(n_cols)
+    widths = [max(_TABLE_MIN_COL_W_PT, (w / total_w) * usable) for w in weights]
+    scale = usable / (sum(widths) or 1.0)
+    return [w * scale for w in widths]
+
+
+def _cell_parts(value: Any) -> Tuple[str, Optional[str], Optional[Dict[str, Any]], bool]:
+    """Return (text, link_url, per-cell style, is_section_row_marker).
+
+    Section rows are dicts like `{"section": "Engagement"}` (or
+    `{"row_type": "section", "text": "..."}`) and span the full table width.
+    """
+    if isinstance(value, dict):
+        if value.get("section") is not None or value.get("row_type") == "section":
+            text = value.get("section")
+            if text is None:
+                text = value.get("text") or value.get("label") or ""
+            return (str(text), None, {"bold": True}, True)
+        text = value.get("text")
+        if text is None:
+            text = value.get("label") or value.get("value") or ""
+        link = value.get("link") or value.get("url") or value.get("href")
+        cell_style = value.get("style")
+        if cell_style is None and value.get("color"):
+            cell_style = {"color": value["color"]}
+        return (
+            "" if text is None else str(text),
+            str(link) if link else None,
+            dict(cell_style) if isinstance(cell_style, dict) else None,
+            False,
+        )
+    return ("" if value is None else str(value), None, None, False)
+
+
+def _is_section_row(row: Any) -> bool:
+    if isinstance(row, dict) and (
+        row.get("section") is not None or row.get("row_type") == "section"
+    ):
+        return True
+    if isinstance(row, list) and len(row) == 1 and isinstance(row[0], dict):
+        return _is_section_row(row[0])
+    return False
+
+
+def _section_label(row: Any) -> str:
+    if isinstance(row, dict):
+        return str(row.get("section") or row.get("text") or row.get("label") or "")
+    if isinstance(row, list) and row:
+        return _section_label(row[0])
+    return ""
+
+
+_COLUMN_ROLE_WEIGHTS = {
+    "label": 1.3,
+    "metric": 0.85,
+    "value": 0.85,
+    "narrative": 2.6,
+    "lecture": 2.6,
+    "text": 2.0,
+}
+_COLUMN_ROLE_ALIGN = {
+    "label": "START",
+    "metric": "END",
+    "value": "END",
+    "narrative": "START",
+    "lecture": "START",
+    "text": "START",
+}
+
+
+def _widths_from_column_roles(
+    roles: List[str], n_cols: int, total_w_pt: float
+) -> List[float]:
+    weights = []
+    for i in range(n_cols):
+        role = str(roles[i] if i < len(roles) else "text").strip().lower()
+        weights.append(_COLUMN_ROLE_WEIGHTS.get(role, 1.0))
+    total = sum(weights) or float(n_cols)
+    usable = max(total_w_pt, _TABLE_MIN_COL_W_PT * n_cols)
+    widths = [max(_TABLE_MIN_COL_W_PT, (w / total) * usable) for w in weights]
+    scale = usable / (sum(widths) or 1.0)
+    return [w * scale for w in widths]
+
+
 def build_table_requests(
     slide_id: str,
     table_spec: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """Create a table on a slide and fill its cells.
+    """Create a compact, theme-aware table on a slide and fill its cells.
 
     `table_spec` shape:
       {
         "headers": ["Metric", "Value"],
-        "rows": [["...", "..."], ...],
-        "position": {"x": 50, "y": 100, "w": 600, "h": 300},  # PT, optional
-        "header_style": {...},  # optional textStyle for the header row
-        "body_style": {...},    # optional textStyle for body rows
+        "rows": [
+          ["...", "..."],
+          {"section": "Engagement"},          # full-width merged section row
+          ["Likes", {"text": "0", "color": "#C5221F"}, "… **important** …"],
+        ],
+        "position": {"x": 40, "y": 95, "w": 640},  # omit h for content-fit
+        "column_widths": [120, 100, 420],
+        "column_roles": ["label", "metric", "narrative"],  # widths + alignment
+        "column_align": ["START", "END", "START"],         # overrides roles
+        "font_family": "Roboto",
+        "font_weight": 300,
+        "font_size": 11,
+        "row_height": 28,
+        "border_color": "#DADCE0",
+        "border_weight": 0.75,
+        "header_underline": true,             # thicker bottom border on header
+        "header_background": null,
+        "zebra": true,                        # or "zebra_color": "#F8F9FA"
+        "header_style": {...},
+        "body_style": {...},
       }
-
-    Each cell may be a plain string/number, or a dict:
-      {"text": "/blog/foo", "link": "https://example.com/blog/foo"}
-    so the visible label can stay short/relative while remaining clickable.
     """
     headers = table_spec.get("headers") or []
-    body_rows = table_spec.get("rows") or []
-    if not headers and not body_rows:
+    raw_body_rows = table_spec.get("rows") or []
+    if not headers and not raw_body_rows:
         return []
 
+    # Normalize body rows: section dicts → single-cell marker lists for sizing,
+    # but we track which logical body indices are sections for merge requests.
+    body_rows: List[List[Any]] = []
+    section_body_indices: List[int] = []
+    for r in raw_body_rows:
+        if _is_section_row(r):
+            section_body_indices.append(len(body_rows))
+            body_rows.append([{"section": _section_label(r)}])
+        else:
+            body_rows.append(list(r) if isinstance(r, (list, tuple)) else [r])
+
     if headers and body_rows:
-        all_rows = [headers] + list(body_rows)
+        all_rows: List[List[Any]] = [list(headers)] + body_rows
+        header_offset = 1
     elif headers:
-        all_rows = [headers]
+        all_rows = [list(headers)]
+        header_offset = 1
     else:
-        all_rows = list(body_rows)
+        all_rows = body_rows
+        header_offset = 0
 
     n_rows = len(all_rows)
-    n_cols = max(len(r) for r in all_rows) if all_rows else 1
-
-    pos = _position(
-        table_spec.get("position"),
-        {"x": 40.0, "y": 90.0, "w": DEFAULT_PAGE_W_PT - 80.0, "h": DEFAULT_PAGE_H_PT - 130.0},
+    n_cols = max(
+        (len(headers) if headers else 0),
+        max((len(r) for r in body_rows), default=1),
+        1,
     )
+    # Pad short rows so createTable grid is rectangular; section rows stay
+    # conceptually 1-cell but we fill placeholders (merged afterward).
+    normalized_rows: List[List[Any]] = []
+    for r_idx, row in enumerate(all_rows):
+        is_section = header_offset and r_idx >= header_offset and (
+            (r_idx - header_offset) in section_body_indices
+        )
+        if is_section:
+            label = _section_label(row[0] if row else "")
+            normalized_rows.append([label] + [""] * (n_cols - 1))
+        else:
+            padded = list(row) + [""] * (n_cols - len(row))
+            normalized_rows.append(padded[:n_cols])
+    all_rows = normalized_rows
+
+    row_h = float(table_spec.get("row_height") or _TABLE_DEFAULT_ROW_H_PT)
+    auto_h = max(row_h * n_rows, row_h)
+    default_pos = {
+        "x": _TABLE_DEFAULT_PAD_X_PT,
+        "y": _TABLE_DEFAULT_PAD_Y_PT,
+        "w": DEFAULT_PAGE_W_PT - (2 * _TABLE_DEFAULT_PAD_X_PT),
+        "h": auto_h,
+    }
+    pos = _position(table_spec.get("position"), default_pos)
+    if not (table_spec.get("position") or {}).get("h"):
+        pos["h"] = min(auto_h, DEFAULT_PAGE_H_PT - pos["y"] - 20.0)
+
+    font_family = table_spec.get("font_family") or table_spec.get("fontFamily")
+    font_weight = table_spec.get("font_weight")
+    if font_weight is not None:
+        try:
+            font_weight = int(font_weight)
+        except (TypeError, ValueError):
+            font_weight = None
+    font_size = table_spec.get("font_size")
+    font_size = float(font_size) if font_size is not None else _TABLE_DEFAULT_FONT_SIZE_PT
+
+    header_style = _normalize_table_text_style(
+        table_spec.get("header_style") or {"bold": True},
+        font_family=font_family,
+        font_weight=(
+            None
+            if (table_spec.get("header_style") or {}).get("font_weight") is not None
+            or (table_spec.get("header_style") or {}).get("weightedFontFamily")
+            else (400 if font_weight and font_weight < 400 else font_weight)
+        ),
+        font_size_pt=font_size,
+    )
+    if "bold" not in header_style:
+        header_style["bold"] = True
+
+    body_style = _normalize_table_text_style(
+        table_spec.get("body_style"),
+        font_family=font_family,
+        font_weight=font_weight,
+        font_size_pt=font_size,
+    )
+    section_style = _normalize_table_text_style(
+        {"bold": True},
+        font_family=font_family,
+        font_weight=600 if not font_weight or font_weight < 600 else font_weight,
+        font_size_pt=font_size,
+    )
+
+    # Theme-linked text color (DARK1 by default) — omit if caller already set it.
+    text_color = table_spec.get("text_color") or "DARK1"
+    for style_dict in (header_style, body_style, section_style):
+        if "foregroundColor" not in style_dict:
+            try:
+                style_dict["foregroundColor"] = _slides_opaque_color(str(text_color))
+            except ValueError:
+                pass
+
+    border_color = table_spec.get("border_color") or _TABLE_DEFAULT_BORDER_COLOR
+    border_w = float(table_spec.get("border_weight") or _TABLE_DEFAULT_BORDER_PT)
+    header_bg = table_spec.get("header_background")
+    header_underline = table_spec.get("header_underline", True)
+    header_underline_color = table_spec.get("header_underline_color") or "DARK1"
+    zebra = table_spec.get("zebra") or table_spec.get("zebra_rows")
+    zebra_color = table_spec.get("zebra_color") or "LIGHT2"
+    section_bg = table_spec.get("section_background") or "LIGHT2"
+
+    roles = table_spec.get("column_roles") or []
+    if roles and not table_spec.get("column_widths"):
+        col_widths = _widths_from_column_roles([str(r) for r in roles], n_cols, pos["w"])
+    else:
+        col_widths = _estimate_col_widths(
+            all_rows, n_cols, pos["w"], explicit=table_spec.get("column_widths")
+        )
+
+    # Per-column paragraph alignment.
+    col_align: List[str] = []
+    explicit_align = table_spec.get("column_align") or table_spec.get("column_aligns") or []
+    for c in range(n_cols):
+        if c < len(explicit_align) and explicit_align[c]:
+            col_align.append(str(explicit_align[c]).upper())
+        elif c < len(roles):
+            col_align.append(_COLUMN_ROLE_ALIGN.get(str(roles[c]).lower(), "START"))
+        else:
+            col_align.append("START")
 
     table_id = gen_id("tbl")
     requests: List[Dict[str, Any]] = [
@@ -552,35 +928,212 @@ def build_table_requests(
         }
     ]
 
-    header_style = table_spec.get("header_style") or {"bold": True}
-    body_style = table_spec.get("body_style")
+    requests.append(
+        {
+            "updateTableRowProperties": {
+                "objectId": table_id,
+                "tableRowProperties": {"minRowHeight": _pt(row_h)},
+                "fields": "minRowHeight",
+            }
+        }
+    )
 
-    def _cell_parts(value: Any) -> Tuple[str, Optional[str]]:
-        if isinstance(value, dict):
-            text = value.get("text")
-            if text is None:
-                text = value.get("label") or value.get("value") or ""
-            link = value.get("link") or value.get("url") or value.get("href")
-            return ("" if text is None else str(text), str(link) if link else None)
-        return ("" if value is None else str(value), None)
+    for c_idx, width in enumerate(col_widths):
+        requests.append(
+            {
+                "updateTableColumnProperties": {
+                    "objectId": table_id,
+                    "columnIndices": [c_idx],
+                    "tableColumnProperties": {
+                        "columnWidth": _pt(max(_TABLE_MIN_COL_W_PT, width))
+                    },
+                    "fields": "columnWidth",
+                }
+            }
+        )
+
+    try:
+        border_fill = _slides_solid_fill(str(border_color), alpha=0.45)
+    except ValueError:
+        border_fill = _slides_solid_fill(_TABLE_DEFAULT_BORDER_COLOR, alpha=0.45)
+    requests.append(
+        {
+            "updateTableBorderProperties": {
+                "objectId": table_id,
+                "borderPosition": "ALL",
+                "tableBorderProperties": {
+                    "tableBorderFill": border_fill,
+                    "weight": _pt(border_w),
+                    "dashStyle": "SOLID",
+                },
+                "fields": "tableBorderFill,weight,dashStyle",
+            }
+        }
+    )
+
+    # Editorial header rule: thicker bottom border under the header row.
+    if headers and header_underline:
+        try:
+            underline_fill = _slides_solid_fill(str(header_underline_color), alpha=0.7)
+        except ValueError:
+            underline_fill = border_fill
+        requests.append(
+            {
+                "updateTableBorderProperties": {
+                    "objectId": table_id,
+                    "tableRange": {
+                        "location": {"rowIndex": 0, "columnIndex": 0},
+                        "rowSpan": 1,
+                        "columnSpan": n_cols,
+                    },
+                    "borderPosition": "BOTTOM",
+                    "tableBorderProperties": {
+                        "tableBorderFill": underline_fill,
+                        "weight": _pt(max(border_w * 2, 1.25)),
+                        "dashStyle": "SOLID",
+                    },
+                    "fields": "tableBorderFill,weight,dashStyle",
+                }
+            }
+        )
+
+    requests.append(
+        {
+            "updateTableCellProperties": {
+                "objectId": table_id,
+                "tableCellProperties": {"contentAlignment": "TOP"},
+                "fields": "contentAlignment",
+            }
+        }
+    )
+    if headers and header_bg:
+        try:
+            requests.append(
+                {
+                    "updateTableCellProperties": {
+                        "objectId": table_id,
+                        "tableRange": {
+                            "location": {"rowIndex": 0, "columnIndex": 0},
+                            "rowSpan": 1,
+                            "columnSpan": n_cols,
+                        },
+                        "tableCellProperties": {
+                            "tableCellBackgroundFill": _slides_solid_fill(str(header_bg)),
+                        },
+                        "fields": "tableCellBackgroundFill.solidFill.color",
+                    }
+                }
+            )
+        except ValueError:
+            pass
+
+    # Zebra striping on body rows (skip section rows).
+    if zebra:
+        try:
+            zebra_fill = _slides_solid_fill(str(zebra_color))
+            for body_i in range(len(body_rows)):
+                if body_i in section_body_indices:
+                    continue
+                if body_i % 2 == 1:
+                    r_idx = body_i + header_offset
+                    requests.append(
+                        {
+                            "updateTableCellProperties": {
+                                "objectId": table_id,
+                                "tableRange": {
+                                    "location": {"rowIndex": r_idx, "columnIndex": 0},
+                                    "rowSpan": 1,
+                                    "columnSpan": n_cols,
+                                },
+                                "tableCellProperties": {
+                                    "tableCellBackgroundFill": zebra_fill,
+                                },
+                                "fields": "tableCellBackgroundFill.solidFill.color",
+                            }
+                        }
+                    )
+        except ValueError:
+            pass
+
+    # Soft fill for section rows.
+    for body_i in section_body_indices:
+        r_idx = body_i + header_offset
+        try:
+            requests.append(
+                {
+                    "updateTableCellProperties": {
+                        "objectId": table_id,
+                        "tableRange": {
+                            "location": {"rowIndex": r_idx, "columnIndex": 0},
+                            "rowSpan": 1,
+                            "columnSpan": n_cols,
+                        },
+                        "tableCellProperties": {
+                            "tableCellBackgroundFill": _slides_solid_fill(
+                                str(section_bg), alpha=0.55
+                            ),
+                        },
+                        "fields": "tableCellBackgroundFill.solidFill.color",
+                    }
+                }
+            )
+        except ValueError:
+            pass
+        if n_cols > 1:
+            requests.append(
+                {
+                    "mergeTableCells": {
+                        "objectId": table_id,
+                        "tableRange": {
+                            "location": {"rowIndex": r_idx, "columnIndex": 0},
+                            "rowSpan": 1,
+                            "columnSpan": n_cols,
+                        },
+                    }
+                }
+            )
 
     for r_idx, row in enumerate(all_rows):
-        for c_idx in range(n_cols):
+        is_header = bool(headers and r_idx == 0)
+        is_section = (
+            header_offset
+            and r_idx >= header_offset
+            and (r_idx - header_offset) in section_body_indices
+        )
+        # Section rows: only fill the first (merged) cell.
+        for c_idx in (range(1) if is_section else range(n_cols)):
             value = row[c_idx] if c_idx < len(row) else ""
-            text, link = _cell_parts(value)
+            text, link, per_cell, _ = _cell_parts(value)
             if not text:
                 continue
+            plain, bold_ranges = _parse_inline_bold(text)
             requests.append(
                 {
                     "insertText": {
                         "objectId": table_id,
                         "cellLocation": {"rowIndex": r_idx, "columnIndex": c_idx},
-                        "text": text,
+                        "text": plain,
                         "insertionIndex": 0,
                     }
                 }
             )
-            cell_style = dict(header_style if (headers and r_idx == 0) else (body_style or {}))
+            if is_section:
+                base = section_style
+            elif is_header:
+                base = header_style
+            else:
+                base = body_style
+            cell_style = dict(base)
+            if per_cell:
+                cell_style.update(
+                    _normalize_table_text_style(
+                        per_cell,
+                        font_family=font_family,
+                        font_size_pt=font_size,
+                    )
+                )
+            if "weightedFontFamily" in cell_style:
+                cell_style.pop("fontFamily", None)
             if link:
                 cell_style["link"] = {"url": link}
             if cell_style:
@@ -595,6 +1148,36 @@ def build_table_requests(
                         }
                     }
                 )
+            for start, end in bold_ranges:
+                if end <= start:
+                    continue
+                requests.append(
+                    {
+                        "updateTextStyle": {
+                            "objectId": table_id,
+                            "cellLocation": {"rowIndex": r_idx, "columnIndex": c_idx},
+                            "textRange": {
+                                "type": "FIXED_RANGE",
+                                "startIndex": start,
+                                "endIndex": end,
+                            },
+                            "style": {"bold": True},
+                            "fields": "bold",
+                        }
+                    }
+                )
+            alignment = "START" if (is_header or is_section) else col_align[c_idx]
+            requests.append(
+                {
+                    "updateParagraphStyle": {
+                        "objectId": table_id,
+                        "cellLocation": {"rowIndex": r_idx, "columnIndex": c_idx},
+                        "textRange": {"type": "ALL"},
+                        "style": {"alignment": alignment},
+                        "fields": "alignment",
+                    }
+                }
+            )
 
     return requests
 
