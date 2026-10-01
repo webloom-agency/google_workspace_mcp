@@ -773,7 +773,6 @@ cp .env.oauth21 .env
 | Tool | Tier | Description |
 |------|------|-------------|
 | `create_audit_presentation` | **Core** | Default deck creation tool. Build a full branded deck from one structured JSON payload (template + tables + images + native Sheets charts + speaker notes). [Schema & example below.](#create_audit_presentation-build-a-full-deck-from-structured-json) |
-| `create_presentation` | **Core** | Create a blank presentation and optionally move it to a folder (low-level primitive). |
 | `get_presentation` | **Core** | Retrieve presentation details |
 | `batch_update_presentation` | Extended | Apply multiple updates |
 | `get_page` | Extended | Get specific slide information |
@@ -1163,12 +1162,6 @@ Response (JSON string):
 - > 150 slides: split.
 
 On any failure after the template copy, the tool best-effort deletes the partial deck and data sheet so retries don't accumulate orphans.
-
-#### `create_presentation`: create a blank deck
-
-Use `create_presentation` only when you explicitly want an empty Google Slides file that you
-will populate later via other tools or manually. For most generated decks, prefer
-`create_audit_presentation`.
 
 ---
 

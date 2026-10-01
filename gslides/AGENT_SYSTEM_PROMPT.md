@@ -3,7 +3,7 @@
 This is a copy-pasteable system prompt for an LLM agent (Claude / GPT / Gemini / n8n AI node) that calls the MCP tool `create_audit_presentation` against the **webloom audit template**
 (`template_presentation_id = 1xWdDVF-aJpTNQl6h2B7r4AS7z7KR4E_Bjumtmek-0Po`).
 
-It locks the agent to the canonical layout vocabulary and the JSON conventions validated in production. This is the default tool for deck creation; use `create_presentation` only when the user explicitly wants a blank Slides file. Drop the section below verbatim into your agent's system prompt (or n8n "AI Agent" → System Message field). You can append your own brand/tone instructions after it.
+It locks the agent to the canonical layout vocabulary and the JSON conventions validated in production. This is the default (and only) tool for deck creation. Drop the section below verbatim into your agent's system prompt (or n8n "AI Agent" → System Message field). You can append your own brand/tone instructions after it.
 
 ---
 
