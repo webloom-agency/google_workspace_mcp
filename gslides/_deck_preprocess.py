@@ -546,6 +546,7 @@ def auto_split_slides(deck: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
                     if part_i > 1:
                         part.pop("chart", None)
                         part.pop("image", None)
+                        part.pop("images", None)
                         part.pop("image_placeholders", None)
                     new_slides.append(part)
                 notes.append(
@@ -574,6 +575,7 @@ def auto_split_slides(deck: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
                         part.pop("chart", None)
                         part.pop("table", None)
                         part.pop("image", None)
+                        part.pop("images", None)
                         part.pop("image_placeholders", None)
                         # Prefer a plain body layout continuation when possible.
                         if "chart" in _normalize_layout(layout):
@@ -714,7 +716,7 @@ async def preflight_image_urls(deck: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             else:
                 slide.pop("image_placeholders", None)
 
-        # free-floating image
+        # free-floating image (singular)
         image = slide.get("image")
         if isinstance(image, dict) and image.get("url"):
             url = str(image["url"])
@@ -734,6 +736,36 @@ async def preflight_image_urls(deck: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
                     f"slide #{slide_idx + 1} free image: {reason} — {url[:120]}"
                 )
                 slide.pop("image", None)
+
+        # free-floating images[] (multi)
+        images = slide.get("images")
+        if isinstance(images, list) and images:
+            kept_imgs: List[Any] = []
+            for item in images:
+                url = item if isinstance(item, str) else (item or {}).get("url")
+                if not url:
+                    continue
+                ok, reason = await _probe_ok(str(url))
+                report.append(
+                    {
+                        "slide": slide_idx + 1,
+                        "kind": "images",
+                        "url": str(url)[:200],
+                        "kept": ok,
+                        "reason": reason,
+                    }
+                )
+                if ok:
+                    kept_imgs.append(item)
+                else:
+                    logger.warning(
+                        f"[create_audit_presentation] Image preflight dropped "
+                        f"slide #{slide_idx + 1} images[] URL: {reason} — {url[:120]}"
+                    )
+            if kept_imgs:
+                slide["images"] = kept_imgs
+            else:
+                slide.pop("images", None)
 
     return out, report
 

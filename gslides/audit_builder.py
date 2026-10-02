@@ -1967,6 +1967,19 @@ async def create_audit_presentation(
                         "detail": skipped,
                     }
                 )
+            promoted = slide_placeholders.get("__promoted_images__")
+            if promoted:
+                logger.info(
+                    f"[create_audit_presentation] Slide #{index + 1}: {promoted}"
+                )
+                placeholder_skips.append(
+                    {
+                        "slide": index + 1,
+                        "layout": slide_spec.get("layout"),
+                        "kind": "image_promoted",
+                        "detail": promoted,
+                    }
+                )
 
             chart_spec = slide_spec.get("chart")
             if chart_spec:

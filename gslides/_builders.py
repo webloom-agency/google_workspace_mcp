@@ -1565,7 +1565,10 @@ def build_slide_with_placeholders(
         if field_name in fields and fields[field_name]:
             allocated = _allocate_placeholder(ph_type, 0, field_name)
             if allocated is None:
-                skipped_fields.append(f"{field_name} ({ph_type})")
+                # title/subtitle/centered_title fall back to free-floating
+                # TEXT_BOX below (Conclusion etc.). Other missing slots warn.
+                if field_name not in ("title", "subtitle", "centered_title"):
+                    skipped_fields.append(f"{field_name} ({ph_type})")
 
     body_value = fields.get("body")
     body_texts: List[str] = []
@@ -1645,32 +1648,55 @@ def build_slide_with_placeholders(
 
     image_placeholder_specs = slide_spec.get("image_placeholders") or []
     image_fill: List[Tuple[str, Dict[str, Any]]] = []
+    # Free-floating images: singular `image`, list `images`, and auto-promoted
+    # image_placeholders when the layout has no PICTURE slots.
+    free_images: List[Dict[str, Any]] = []
+    if isinstance(slide_spec.get("image"), dict) and slide_spec["image"].get("url"):
+        free_images.append(dict(slide_spec["image"]))
+    for raw in slide_spec.get("images") or []:
+        if isinstance(raw, str) and raw.strip():
+            free_images.append({"url": raw.strip()})
+        elif isinstance(raw, dict) and raw.get("url"):
+            free_images.append(dict(raw))
+
     n_picture_slots = len(layout_placeholders_by_type.get("PICTURE") or [])
     layout_label = slide_spec.get("layout") or "(unknown)"
+    promoted_notes: List[str] = []
+    # Default frames for promoted / position-less free images (logo → pair).
+    _free_image_frames = [
+        {"x": 540.0, "y": 48.0, "w": 150.0, "h": 70.0},
+        {"x": 40.0, "y": 100.0, "w": 310.0, "h": 250.0},
+        {"x": 370.0, "y": 100.0, "w": 310.0, "h": 250.0},
+        {"x": 60.0, "y": 90.0, "w": 600.0, "h": 280.0},
+    ]
+
     for i, raw in enumerate(image_placeholder_specs):
         if isinstance(raw, str):
             spec = {"url": raw}
         elif isinstance(raw, dict):
-            spec = raw
+            spec = dict(raw)
         else:
             continue
         if not spec.get("url"):
             continue
         allocated = _allocate_placeholder("PICTURE", i, f"image[{i}]")
         if allocated is None:
-            # Do NOT silently drop — logos on Title + Table / Conclusion / etc.
-            # have nowhere to land. Surface a clear error for the MCP response.
-            err = (
-                f"image_placeholders[{i}] rejected: layout '{layout_label}' has "
-                f"{n_picture_slots} PICTURE placeholder(s). Put logos on Cover "
-                f"(or Title + Body with a PICTURE slot), or pass a free-floating "
-                f"`image` block — Title + Table / Two Columns / Conclusion cannot "
-                f"host logos via image_placeholders."
+            # Auto-promote: same URL, free-floating createImage — agents keep
+            # sending image_placeholders on Title + Table / Two Columns / etc.
+            frame = dict(_free_image_frames[min(len(free_images), len(_free_image_frames) - 1)])
+            if not spec.get("position"):
+                spec["position"] = frame
+            free_images.append(spec)
+            note = (
+                f"image_placeholders[{i}] auto-promoted to free-floating image on "
+                f"layout '{layout_label}' (0 PICTURE slots available of {n_picture_slots})"
             )
-            skipped_fields.append(err)
+            promoted_notes.append(note)
             continue
         image_fill.append((allocated, spec))
 
+    if promoted_notes:
+        placeholder_ids["__promoted_images__"] = "; ".join(promoted_notes)
     if skipped_fields:
         # Surface this as part of the returned placeholder_ids so the caller can
         # log it. We don't raise: a missing placeholder in the layout is a soft
@@ -1714,7 +1740,11 @@ def build_slide_with_placeholders(
         "weightedFontFamily": {"fontFamily": "Roboto", "weight": 300},
     }
 
-    def _with_light_weight(style: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _with_light_weight(
+        style: Optional[Dict[str, Any]],
+        *,
+        force_light: bool = False,
+    ) -> Dict[str, Any]:
         base = dict(_light_fallback)
         if isinstance(style, dict):
             base.update(style)
@@ -1727,7 +1757,9 @@ def build_slide_with_placeholders(
         if str(family).strip().lower() in ("roboto light", "robotolight"):
             family = "Roboto"
         weight = wff.get("weight")
-        if weight is None:
+        # Two Columns: always Light (300) unless caller asked for a heavier face
+        # via an explicit weight AND force_light is False.
+        if force_light or weight is None:
             weight = 300
         base["fontFamily"] = str(family)
         base["weightedFontFamily"] = {
@@ -1744,10 +1776,13 @@ def build_slide_with_placeholders(
             style = body_style[i] if i < len(body_style) else None
         else:
             style = body_style
-        # Two Columns (2+ bodies): always apply Light weight on both columns.
+        # Two Columns (2+ bodies) OR any TEXT_BOX overlay: force Roboto Light.
         multi_body = len(body_texts) > 1 or i in body_overlays
         if multi_body or i in body_overlays:
-            style = _with_light_weight(style if isinstance(style, dict) else None)
+            style = _with_light_weight(
+                style if isinstance(style, dict) else None,
+                force_light=True,
+            )
 
         overlay = body_overlays.get(i)
         if overlay is not None:
@@ -1767,11 +1802,33 @@ def build_slide_with_placeholders(
                     }
                 }
             )
+            # TOP so both columns share the same vertical origin (layout BODY[0]
+            # often inherits MIDDLE, which misaligns vs the TEXT_BOX default TOP).
+            content_requests.append(
+                {
+                    "updateShapeProperties": {
+                        "objectId": overlay_id,
+                        "shapeProperties": {"contentAlignment": "TOP"},
+                        "fields": "contentAlignment",
+                    }
+                }
+            )
             content_requests.extend(
                 build_text_insert_requests(overlay_id, body_text, style)
             )
             continue
 
+        # Two Columns left BODY: force TOP to match the right overlay.
+        if multi_body:
+            content_requests.append(
+                {
+                    "updateShapeProperties": {
+                        "objectId": ph_id,
+                        "shapeProperties": {"contentAlignment": "TOP"},
+                        "fields": "contentAlignment",
+                    }
+                }
+            )
         content_requests.extend(build_text_insert_requests(ph_id, body_text, style))
 
     # Fill PICTURE placeholder(s) via replaceImage. The placeholder we mapped
@@ -1792,9 +1849,50 @@ def build_slide_with_placeholders(
             }
         )
 
-    # Free-floating title for BLANK-ish layouts when caller passes top-level "title".
+    # Free-floating title/subtitle when the layout has no TITLE/SUBTITLE
+    # placeholders (e.g. Conclusion) but the agent still sent fields.*.
+    _light_title = {
+        "fontFamily": "Roboto",
+        "weightedFontFamily": {"fontFamily": "Roboto", "weight": 300},
+        "bold": True,
+        "fontSize": {"magnitude": 28, "unit": "PT"},
+    }
+    _light_subtitle = {
+        "fontFamily": "Roboto",
+        "weightedFontFamily": {"fontFamily": "Roboto", "weight": 300},
+        "fontSize": {"magnitude": 14, "unit": "PT"},
+    }
+    if fields.get("title") and "title" not in placeholder_ids:
+        title_style = (slide_spec.get("styles") or {}).get("title") or _light_title
+        _, title_requests = build_text_box(
+            slide_id=slide_id,
+            text=str(fields["title"]),
+            position={"x": 60.0, "y": 150.0, "w": DEFAULT_PAGE_W_PT - 120.0, "h": 60.0},
+            style=title_style,
+            paragraph_alignment="CENTER",
+        )
+        content_requests.extend(title_requests)
+        placeholder_ids["__free_title__"] = "1"
+    if fields.get("subtitle") and "subtitle" not in placeholder_ids:
+        sub_style = (slide_spec.get("styles") or {}).get("subtitle") or _light_subtitle
+        _, sub_requests = build_text_box(
+            slide_id=slide_id,
+            text=str(fields["subtitle"]),
+            position={"x": 80.0, "y": 220.0, "w": DEFAULT_PAGE_W_PT - 160.0, "h": 50.0},
+            style=sub_style,
+            paragraph_alignment="CENTER",
+        )
+        content_requests.extend(sub_requests)
+        placeholder_ids["__free_subtitle__"] = "1"
+
+    # Free-floating title for BLANK-ish layouts when caller passes top-level "title"
+    # (legacy) — skip if we already placed fields.title above.
     standalone_title = slide_spec.get("title")
-    if standalone_title and "title" not in placeholder_ids:
+    if (
+        standalone_title
+        and "title" not in placeholder_ids
+        and "__free_title__" not in placeholder_ids
+    ):
         _, title_requests = build_text_box(
             slide_id=slide_id,
             text=str(standalone_title),
@@ -1827,8 +1925,15 @@ def build_slide_with_placeholders(
                     }
         content_requests.extend(build_table_requests(slide_id, table_spec))
 
-    if "image" in slide_spec and slide_spec["image"]:
-        content_requests.extend(build_image_requests(slide_id, slide_spec["image"]))
+    # Free-floating images: singular `image`, list `images`, and auto-promoted
+    # image_placeholders (above). Assign default frames when position omitted.
+    for img_i, img_spec in enumerate(free_images):
+        spec = dict(img_spec)
+        if not spec.get("position"):
+            spec["position"] = dict(
+                _free_image_frames[min(img_i, len(_free_image_frames) - 1)]
+            )
+        content_requests.extend(build_image_requests(slide_id, spec))
 
     if "text_boxes" in slide_spec and slide_spec["text_boxes"]:
         for tb in slide_spec["text_boxes"]:
