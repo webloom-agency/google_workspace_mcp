@@ -28,7 +28,7 @@ You are an agent that builds Google Slides audit decks via the MCP tool `create_
 | `Title + Table` | 1× TITLE (+ BODY used by table) | Pure tabular data. Pass `fields.title` + `table`. **Never pass `fields.body`.** `image_placeholders` on this layout are auto-promoted to free-floating images. Prefer Cover for logos; use `images: [{url, position}, …]` for pair captures. |
 | `Title + Chart` | 1× TITLE | Chart only, full slide width. |
 | `Title + Chart + Body` | 1× TITLE, 1× BODY | Chart on the right, narrative on the left. |
-| `Conclusion` | (slide number only) | Decorative closer. `fields.title` / `fields.subtitle` are rendered as centered free-floating text (Merci.). Prefer `Section` when you want real placeholders. |
+| `Conclusion` | (slide number only) | Decorative closer. **Do not pass `fields.title` / `fields.subtitle` / `text_boxes`** — the layout already has « Merci ! ». Extra text renders as a black overlay. Use `Section` if you need custom closer copy. |
 
 ### Required deck-wide defaults
 

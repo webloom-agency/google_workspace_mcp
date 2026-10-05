@@ -67,6 +67,25 @@ def _normalize_layout_name(name: str) -> str:
     return " ".join(str(name).strip().lower().split())
 
 
+def _is_decorative_layout(
+    layout_name: str,
+    layout_placeholders_by_type: Optional[Dict[str, List[int]]] = None,
+) -> bool:
+    """True for closer / splash layouts that already carry baked-in copy.
+
+    Conclusion has no TITLE/SUBTITLE placeholders — the white « Merci ! » is
+    painted on the layout. Overlaying fields.title as a default-black TEXT_BOX
+    is the 'weird black placeholder' on the last slide.
+    """
+    key = _normalize_layout_name(layout_name)
+    if key in {"conclusion", "cover"}:
+        return True
+    if layout_placeholders_by_type is None:
+        return False
+    text_types = ("TITLE", "SUBTITLE", "CENTERED_TITLE", "BODY")
+    return not any(layout_placeholders_by_type.get(t) for t in text_types)
+
+
 def _list_template_layouts(presentation: Dict[str, Any]) -> List[str]:
     """Return display names of every custom layout in the copied template."""
     names: List[str] = []
@@ -369,6 +388,72 @@ def _position(spec: Optional[Dict[str, Any]], default: Dict[str, float]) -> Dict
             if k in spec and spec[k] is not None:
                 out[k] = float(spec[k])
     return out
+
+
+def _rects_overlap(a: Dict[str, float], b: Dict[str, float], gap: float = 0.0) -> bool:
+    return not (
+        a["x"] + a["w"] + gap <= b["x"]
+        or b["x"] + b["w"] + gap <= a["x"]
+        or a["y"] + a["h"] + gap <= b["y"]
+        or b["y"] + b["h"] + gap <= a["y"]
+    )
+
+
+def _clamp_image_away_from_body(
+    pos: Dict[str, float],
+    body_box: Dict[str, float],
+    *,
+    gap: float = 12.0,
+) -> Dict[str, float]:
+    """Shift/shrink a free-floating image so it does not cover the BODY frame."""
+    img = {
+        "x": float(pos["x"]),
+        "y": float(pos["y"]),
+        "w": float(pos["w"]),
+        "h": float(pos["h"]),
+    }
+    if not _rects_overlap(img, body_box, gap=0.0):
+        return img
+
+    # Prefer right of body when there is room.
+    right_x = body_box["x"] + body_box["w"] + gap
+    avail_right = DEFAULT_PAGE_W_PT - 20.0 - right_x
+    if avail_right >= 80.0:
+        return {
+            "x": right_x,
+            "y": img["y"],
+            "w": min(img["w"], avail_right),
+            "h": img["h"],
+        }
+
+    # Else left of body.
+    avail_left = body_box["x"] - gap - 20.0
+    if avail_left >= 80.0:
+        return {
+            "x": 20.0,
+            "y": img["y"],
+            "w": min(img["w"], avail_left),
+            "h": img["h"],
+        }
+
+    # Else above body.
+    avail_above = body_box["y"] - gap - 40.0
+    if avail_above >= 40.0:
+        h = min(img["h"], avail_above)
+        return {
+            "x": img["x"],
+            "y": max(40.0, body_box["y"] - gap - h),
+            "w": img["w"],
+            "h": h,
+        }
+
+    # Last resort: park in the right margin even if narrow.
+    return {
+        "x": min(right_x, DEFAULT_PAGE_W_PT - min(img["w"], 100.0) - 20.0),
+        "y": img["y"],
+        "w": min(img["w"], max(60.0, avail_right) if avail_right > 0 else 100.0),
+        "h": img["h"],
+    }
 
 
 def _utf16_len(s: str) -> int:
@@ -1556,6 +1641,8 @@ def build_slide_with_placeholders(
         placeholder_mappings.append({"layoutPlaceholder": mapping, "objectId": ph_id})
         return ph_id
 
+    decorative = _is_decorative_layout(layout_name, layout_placeholders_by_type)
+
     simple_text_fields = {
         "title": "TITLE",
         "centered_title": "CENTERED_TITLE",
@@ -1563,12 +1650,20 @@ def build_slide_with_placeholders(
     }
     for field_name, ph_type in simple_text_fields.items():
         if field_name in fields and fields[field_name]:
+            if decorative:
+                skipped_fields.append(
+                    f"{field_name} ignored on '{layout_name}': layout already "
+                    f"has baked-in copy (use Section for Merci. / title+subtitle)"
+                )
+                continue
             allocated = _allocate_placeholder(ph_type, 0, field_name)
             if allocated is None:
-                # title/subtitle/centered_title fall back to free-floating
-                # TEXT_BOX below (Conclusion etc.). Other missing slots warn.
-                if field_name not in ("title", "subtitle", "centered_title"):
-                    skipped_fields.append(f"{field_name} ({ph_type})")
+                # Layouts with 0 TITLE/SUBTITLE: ignore — do not invent a
+                # default-black TEXT_BOX on top of the template.
+                skipped_fields.append(
+                    f"{field_name} ignored: layout has no {ph_type} placeholder "
+                    f"(use Section for Merci. / title+subtitle)"
+                )
 
     body_value = fields.get("body")
     body_texts: List[str] = []
@@ -1585,6 +1680,12 @@ def build_slide_with_placeholders(
         skipped_fields.append(
             "body (ignored: table occupies BODY on this layout — omit fields.body "
             "on Title + Table, or put narrative on a Title + Body slide)"
+        )
+        body_texts = []
+    if decorative and any(t.strip() for t in body_texts):
+        skipped_fields.append(
+            f"body ignored on '{layout_name}': layout has no BODY placeholder "
+            f"(baked-in closer / cover)"
         )
         body_texts = []
 
@@ -1697,12 +1798,6 @@ def build_slide_with_placeholders(
 
     if promoted_notes:
         placeholder_ids["__promoted_images__"] = "; ".join(promoted_notes)
-    if skipped_fields:
-        # Surface this as part of the returned placeholder_ids so the caller can
-        # log it. We don't raise: a missing placeholder in the layout is a soft
-        # mismatch, not a fatal error — better to render the rest of the slide
-        # than to abort the whole deck.
-        placeholder_ids["__skipped__"] = ",".join(skipped_fields)
 
     creation_requests: List[Dict[str, Any]] = [
         build_create_slide(
@@ -1849,49 +1944,14 @@ def build_slide_with_placeholders(
             }
         )
 
-    # Free-floating title/subtitle when the layout has no TITLE/SUBTITLE
-    # placeholders (e.g. Conclusion) but the agent still sent fields.*.
-    _light_title = {
-        "fontFamily": "Roboto",
-        "weightedFontFamily": {"fontFamily": "Roboto", "weight": 300},
-        "bold": True,
-        "fontSize": {"magnitude": 28, "unit": "PT"},
-    }
-    _light_subtitle = {
-        "fontFamily": "Roboto",
-        "weightedFontFamily": {"fontFamily": "Roboto", "weight": 300},
-        "fontSize": {"magnitude": 14, "unit": "PT"},
-    }
-    if fields.get("title") and "title" not in placeholder_ids:
-        title_style = (slide_spec.get("styles") or {}).get("title") or _light_title
-        _, title_requests = build_text_box(
-            slide_id=slide_id,
-            text=str(fields["title"]),
-            position={"x": 60.0, "y": 150.0, "w": DEFAULT_PAGE_W_PT - 120.0, "h": 60.0},
-            style=title_style,
-            paragraph_alignment="CENTER",
-        )
-        content_requests.extend(title_requests)
-        placeholder_ids["__free_title__"] = "1"
-    if fields.get("subtitle") and "subtitle" not in placeholder_ids:
-        sub_style = (slide_spec.get("styles") or {}).get("subtitle") or _light_subtitle
-        _, sub_requests = build_text_box(
-            slide_id=slide_id,
-            text=str(fields["subtitle"]),
-            position={"x": 80.0, "y": 220.0, "w": DEFAULT_PAGE_W_PT - 160.0, "h": 50.0},
-            style=sub_style,
-            paragraph_alignment="CENTER",
-        )
-        content_requests.extend(sub_requests)
-        placeholder_ids["__free_subtitle__"] = "1"
-
-    # Free-floating title for BLANK-ish layouts when caller passes top-level "title"
-    # (legacy) — skip if we already placed fields.title above.
+    # Free-floating title ONLY on BLANK (or equivalent). Never overlay a
+    # default-black TEXT_BOX on Conclusion / Cover — those already have copy.
     standalone_title = slide_spec.get("title")
     if (
         standalone_title
         and "title" not in placeholder_ids
-        and "__free_title__" not in placeholder_ids
+        and not decorative
+        and _normalize_layout_name(layout_name) in {"blank", ""}
     ):
         _, title_requests = build_text_box(
             slide_id=slide_id,
@@ -1900,6 +1960,11 @@ def build_slide_with_placeholders(
             style={"bold": True, "fontSize": {"magnitude": 22, "unit": "PT"}},
         )
         content_requests.extend(title_requests)
+    elif standalone_title and "title" not in placeholder_ids:
+        skipped_fields.append(
+            f"top-level title ignored on '{layout_name}' "
+            f"(no TITLE placeholder — use Section, not Conclusion)"
+        )
 
     if "table" in slide_spec and slide_spec["table"]:
         table_spec = dict(slide_spec["table"])
@@ -1925,30 +1990,54 @@ def build_slide_with_placeholders(
                     }
         content_requests.extend(build_table_requests(slide_id, table_spec))
 
+    # Resolve BODY frame once — keep free-floating images out of body text.
+    body_box: Optional[Dict[str, float]] = None
+    if discovered_layout_id and body_texts:
+        geom = get_layout_placeholder_geometry(
+            presentation, discovered_layout_id, "BODY", 0
+        )
+        if geom is not None:
+            size, transform = geom
+            body_box = geometry_to_position(size, transform)
+
     # Free-floating images: singular `image`, list `images`, and auto-promoted
-    # image_placeholders (above). Assign default frames when position omitted.
+    # image_placeholders (above). Assign default frames when position omitted;
+    # clamp away from BODY when the slide also has body text.
     for img_i, img_spec in enumerate(free_images):
         spec = dict(img_spec)
         if not spec.get("position"):
             spec["position"] = dict(
                 _free_image_frames[min(img_i, len(_free_image_frames) - 1)]
             )
+        pos = _position(spec.get("position"), _free_image_frames[0])
+        if body_box is not None:
+            pos = _clamp_image_away_from_body(pos, body_box)
+        spec["position"] = pos
         content_requests.extend(build_image_requests(slide_id, spec))
 
     if "text_boxes" in slide_spec and slide_spec["text_boxes"]:
-        for tb in slide_spec["text_boxes"]:
-            text = tb.get("text", "")
-            position = _position(
-                tb.get("position"),
-                {"x": 40.0, "y": 100.0, "w": 300.0, "h": 100.0},
+        if decorative:
+            skipped_fields.append(
+                f"text_boxes ignored on '{layout_name}' "
+                f"(decorative layout — baked-in copy already present)"
             )
-            _, tb_requests = build_text_box(
-                slide_id=slide_id,
-                text=text,
-                position=position,
-                style=tb.get("style"),
-                paragraph_alignment=tb.get("alignment"),
-            )
-            content_requests.extend(tb_requests)
+        else:
+            for tb in slide_spec["text_boxes"]:
+                text = tb.get("text", "")
+                position = _position(
+                    tb.get("position"),
+                    {"x": 40.0, "y": 100.0, "w": 300.0, "h": 100.0},
+                )
+                _, tb_requests = build_text_box(
+                    slide_id=slide_id,
+                    text=text,
+                    position=position,
+                    style=tb.get("style"),
+                    paragraph_alignment=tb.get("alignment"),
+                )
+                content_requests.extend(tb_requests)
+
+    if skipped_fields:
+        placeholder_ids["__skipped__"] = "; ".join(skipped_fields)
 
     return slide_id, creation_requests, content_requests, placeholder_ids, deferred_lookups
