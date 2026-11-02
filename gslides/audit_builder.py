@@ -1403,6 +1403,7 @@ async def create_audit_presentation(
     deck: Dict[str, Any],
     folder_id: Optional[str] = None,
     folder_path: Optional[List[str]] = None,
+    root_folder_id: Optional[str] = None,
     create_folders_if_missing: bool = True,
     if_exists: str = "create_new",
     cleanup_data_sheet: bool = False,
@@ -1509,6 +1510,9 @@ async def create_audit_presentation(
         deck: Structured deck definition (see schema above). Required.
         folder_id: Specific Drive folder ID to place the deck in. Mutually exclusive with folder_path.
         folder_path: Folder path to navigate/create (e.g. ["CLIENTS", "edaa.fr", "SEO"]).
+        root_folder_id: When using folder_path, start navigation from this folder / Shared Drive id
+            (e.g. org Drive root). If omitted, starts from My Drive root. Inaccessible roots soft-fail
+            to My Drive via find_or_create_folder_path returning None.
         create_folders_if_missing: If True, missing folders in folder_path are created. Default True.
         if_exists: One of "create_new" (append timestamp suffix), "replace" (delete existing in
             folder), or "skip" (return existing deck untouched). Default "create_new".
@@ -1703,7 +1707,7 @@ async def create_audit_presentation(
         folder_result = await find_or_create_folder_path(
             drive_service,
             folder_path,
-            root_folder_id=None,
+            root_folder_id=root_folder_id,
             create_missing=create_folders_if_missing,
         )
         if folder_result:

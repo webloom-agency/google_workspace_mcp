@@ -145,7 +145,7 @@ async def find_folder_by_name_pattern(
     else:
         query = f"mimeType='application/vnd.google-apps.folder' and name contains '{escaped_pattern}' and trashed=false"
     
-    # Add parent folder constraint if specified (this searches recursively)
+    # Add parent folder constraint if specified (direct children only via "in parents")
     if parent_folder_id:
         escaped_parent_id = parent_folder_id.replace("'", "\\'")
         query += f" and '{escaped_parent_id}' in parents"
@@ -154,15 +154,26 @@ async def find_folder_by_name_pattern(
         logger.info(f"[find_folder_by_name_pattern] Searching for folder with pattern: '{name_pattern}' across all Drive (exact={exact_match})")
     
     try:
+        # Shared Drive / org-root children are invisible without corpora=allDrives
+        # (default corpus is the user's My Drive only). That caused org-root
+        # path walks to miss existing CLIENTS/… folders and create duplicates.
+        list_kwargs: Dict[str, Any] = {
+            "q": query,
+            "pageSize": 10,
+            "fields": "files(id, name, webViewLink, modifiedTime, parents)",
+            "orderBy": "modifiedTime desc",
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "corpora": "allDrives",
+        }
+        # When the parent is the Shared Drive itself (ids often start with 0A),
+        # prefer corpora=drive + driveId for a tighter, documented scope.
+        if parent_folder_id and parent_folder_id.startswith("0A"):
+            list_kwargs["corpora"] = "drive"
+            list_kwargs["driveId"] = parent_folder_id
+
         results = await asyncio.to_thread(
-            service.files().list(
-                q=query,
-                pageSize=10,
-                fields="files(id, name, webViewLink, modifiedTime, parents)",
-                orderBy="modifiedTime desc",
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            ).execute
+            service.files().list(**list_kwargs).execute
         )
         
         folders = results.get('files', [])
@@ -339,6 +350,23 @@ async def find_or_create_folder_path(
     # This ensures the first folder is searched in My Drive root, not anywhere in Drive
     current_parent_id = root_folder_id if root_folder_id else 'root'
     path_summary = []
+
+    # Soft-fail inaccessible org / Shared Drive roots so callers can fall back to My Drive.
+    if root_folder_id:
+        try:
+            await asyncio.to_thread(
+                service.files().get(
+                    fileId=root_folder_id,
+                    fields="id, name, mimeType",
+                    supportsAllDrives=True,
+                ).execute
+            )
+        except Exception as e:
+            logger.warning(
+                f"[find_or_create_folder_path] root_folder_id={root_folder_id} inaccessible ({e}); "
+                "returning None for My Drive fallback"
+            )
+            return None
     
     for i, folder_name in enumerate(folder_path):
         # Try to find existing folder with exact name match

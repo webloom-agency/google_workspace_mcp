@@ -342,7 +342,8 @@ async def create_doc(
             drive_service.files().create(
                 body=file_metadata,
                 media_body=media,
-                fields='id'
+                fields='id',
+                supportsAllDrives=True,
             ).execute
         )
         doc_id = doc.get('id')
@@ -434,11 +435,13 @@ async def create_doc(
                 'parents': [html_folder_id],
                 'mimeType': 'text/html'
             }
+            # Shared Drive parents 404 without supportsAllDrives (classic Drive API trap).
             html_file = await asyncio.to_thread(
                 drive_service.files().create(
                     body=html_file_metadata,
                     media_body=html_media,
-                    fields='id, webViewLink'
+                    fields='id, webViewLink',
+                    supportsAllDrives=True,
                 ).execute
             )
             html_file_id = html_file.get('id')
